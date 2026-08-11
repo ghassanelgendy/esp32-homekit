@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TV Screensaver - Wallpapers & Clock</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <!-- Load Outfit for premium, Apple-like light typography -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@200;300;400;500&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+        }
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover; /* Fit to screen and crop extras */
+            opacity: 0;
+            transition: opacity 2.5s ease-in-out;
+            z-index: 1;
+        }
+        .active {
+            opacity: 1;
+            z-index: 2;
+        }
+
+        /* Glassmorphic rectangular tag (no shadow, no rounded corners) */
+        .clock-container {
+            position: absolute;
+            bottom: 8%;
+            left: 0;
+            z-index: 10;
+            color: #ffffff;
+            text-align: left;
+            font-family: 'Outfit', sans-serif;
+            pointer-events: none;
+            
+            /* Glassmorphism background */
+            background: rgba(10, 10, 15, 0.3);
+            backdrop-filter: blur(25px);
+            -webkit-backdrop-filter: blur(25px);
+            
+            /* Clean rectangular layout (no rounded corners, no box shadow) */
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-left: none;
+            border-radius: 0;
+            box-shadow: none;
+            
+            /* Spacious interior margins */
+            padding: 24px 48px 24px 32px;
+        }
+        
+        .time {
+            font-size: 5.5rem;
+            font-weight: 200;
+            line-height: 0.9;
+            letter-spacing: -1px;
+        }
+        
+        .date {
+            font-size: 1.4rem;
+            font-weight: 400;
+            opacity: 0.85;
+            margin-top: 8px;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            font-weight: 300;
+        }
+
+        /* Goodbye Overlay & Text Flash */
+        .goodbye-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 101;
+            opacity: 1;
+            transition: opacity 0.5s ease-out;
+        }
+        
+        .goodbye-text {
+            font-size: 5.5rem;
+            font-weight: 200;
+            color: #fff;
+            font-family: 'Outfit', sans-serif;
+            text-transform: uppercase;
+            letter-spacing: 6px;
+            animation: textFlash 2.2s ease-in-out forwards;
+        }
+
+        @keyframes textFlash {
+            0% { opacity: 0; transform: scale(0.9); }
+            35% { opacity: 1; transform: scale(1.03); }
+            75% { opacity: 1; transform: scale(1); }
+            100% { opacity: 0; transform: scale(1.08); filter: blur(4px); }
+        }
+
+        /* Curtain closing & opening effect */
+        .curtain {
+            position: absolute;
+            top: 0;
+            height: 100%;
+            width: 50.5%; /* Overlap slightly in center */
+            background-color: #000;
+            z-index: 100;
+            transition: transform 1.2s cubic-bezier(0.77, 0, 0.175, 1);
+        }
+        
+        .curtain-left {
+            left: 0;
+            transform: translateX(0); /* Start closed to hide initial image load */
+        }
+        
+        .curtain-right {
+            right: 0;
+            transform: translateX(0); /* Start closed */
+        }
+
+        /* Slide off-screen to open */
+        .curtain-left.open {
+            transform: translateX(-100%);
+        }
+        
+        .curtain-right.open {
+            transform: translateX(100%);
+        }
+    </style>
+</head>
+<body>
+    <img id="slide1" class="slide" src="" alt="">
+    <img id="slide2" class="slide" src="" alt="">
+
+    <!-- Glassmorphic tag clock overlay -->
+    <div class="clock-container" id="clock" style="display: none;">
+        <div class="time" id="time">12:00 PM</div>
+        <div class="date" id="date">Thursday, January 1</div>
+    </div>
+
+    <!-- Power Off Animations (Curtains & Goodbye text) -->
+    <div class="goodbye-overlay" id="goodbye-overlay">
+        <div class="goodbye-text">Goodbye</div>
+    </div>
+    <div class="curtain curtain-left" id="curtain-left"></div>
+    <div class="curtain curtain-right" id="curtain-right"></div>
+
+    <script>
+        let wallpapers = [];
+        let currentIndex = 0;
+        const slide1 = document.getElementById('slide1');
+        const slide2 = document.getElementById('slide2');
+        let activeSlide = slide1;
+        let nextSlide = slide2;
+
+        // Clock logic with UTC+3 Timezone Offset Correction
+        function updateClock() {
+            const now = new Date();
+            const utcTime = now.getTime() + (now.getTimezoneOffset() * 60000);
+            const localTime = new Date(utcTime + (3600000 * 3));
+            
+            let hours = localTime.getHours();
+            const minutes = String(localTime.getMinutes()).padStart(2, '0');
+            const ampm = hours >= 12 ? 'PM' : 'AM';
+            
+            hours = hours % 12;
+            hours = hours ? hours : 12; // convert 0 to 12
+            
+            const timeString = `${hours}:${minutes} <span style="font-size: 2.2rem; font-weight: 300; margin-left: 2px; opacity: 0.8;">${ampm}</span>`;
+            
+            const options = { weekday: 'long', month: 'long', day: 'numeric' };
+            const dateString = localTime.toLocaleDateString('en-US', options);
+            
+            document.getElementById('time').innerHTML = timeString;
+            document.getElementById('date').textContent = dateString;
+        }
+
+        // Wallpaper logic
+        async function loadWallpapers() {
+            try {
+                const response = await fetch('/wallpapers');
+                wallpapers = await response.json();
+                wallpapers.sort(() => Math.random() - 0.5);
+                if (wallpapers.length > 0) {
+                    startSlideshow();
+                }
+            } catch (err) {
+                console.error("Failed to load wallpapers:", err);
+            }
+        }
+
+        function transitionToNext() {
+            if (wallpapers.length === 0) return;
+            
+            const filename = wallpapers[currentIndex];
+            nextSlide.src = `/wallpaper/${encodeURIComponent(filename)}`;
+            
+            nextSlide.onload = () => {
+                activeSlide.classList.remove('active');
+                nextSlide.classList.add('active');
+                
+                const temp = activeSlide;
+                activeSlide = nextSlide;
+                nextSlide = temp;
+                
+                currentIndex = (currentIndex + 1) % wallpapers.length;
+            };
+
+            nextSlide.onerror = () => {
+                currentIndex = (currentIndex + 1) % wallpapers.length;
+                transitionToNext();
+            };
+        }
+
+        function startSlideshow() {
+            if (wallpapers.length === 0) return;
+            const filename = wallpapers[currentIndex];
+            activeSlide.src = `/wallpaper/${encodeURIComponent(filename)}`;
+            activeSlide.classList.add('active');
+            currentIndex = (currentIndex + 1) % wallpapers.length;
+            
+            // Set wallpaper cycle to 40 seconds (each wallpaper stays longer)
+            setInterval(transitionToNext, 40000);
+        }
+
+        // Power Off Transition Choreography
+        function runPowerOffTransitions() {
+            // 1. Goodbye text animates (flashes and fades)
+            // 2. Hide goodbye overlay and trigger curtain opening at 2.3 seconds
+            setTimeout(() => {
+                document.getElementById('goodbye-overlay').style.opacity = '0';
+                
+                // Open the curtains
+                document.getElementById('curtain-left').classList.add('open');
+                document.getElementById('curtain-right').classList.add('open');
+                
+                // Show the clock
+                document.getElementById('clock').style.display = 'block';
+            }, 2300);
+
+            // 3. Remove the goodbye overlay from DOM completely at 3 seconds
+            setTimeout(() => {
+                document.getElementById('goodbye-overlay').style.display = 'none';
+            }, 3000);
+        }
+
+        // Initialize
+        updateClock();
+        setInterval(updateClock, 1000);
+        loadWallpapers();
+        
+        // Start curtain and goodbye sequence on load
+        runPowerOffTransitions();
+    </script>
+</body>
+</html>

@@ -1,0 +1,156 @@
+{
+    "bridge": {
+        "name": "Homebridge",
+        "username": "XX:XX:XX:XX:XX:XX",
+        "port": 51700,
+        "pin": "000-00-000",
+        "advertiser": "ciao"
+    },
+    "accessories": [
+        {
+            "accessory": "HTTP-LIGHTBULB",
+            "name": "LED Strip Light",
+            "onUrl": "http://YOUR_ESP32_IP/led/on?bg=true",
+            "offUrl": "http://YOUR_ESP32_IP/led/off?bg=true",
+            "statusUrl": "http://YOUR_ESP32_IP/led/status",
+            "statusPattern": "\"power\":true",
+            "brightness": {
+                "setUrl": "http://YOUR_ESP32_IP/led/brightness?value=%s",
+                "statusUrl": "http://YOUR_ESP32_IP/led/status",
+                "statusPattern": "\"brightness\":([0-9]+)",
+                "patternGroupToExtract": 1
+            },
+            "hue": {
+                "setUrl": "http://YOUR_ESP32_IP/led/hue?value=%s",
+                "statusUrl": "http://YOUR_ESP32_IP/led/status",
+                "statusPattern": "\"hue\":([0-9]+)",
+                "patternGroupToExtract": 1
+            },
+            "saturation": {
+                "setUrl": "http://YOUR_ESP32_IP/led/saturation?value=%s",
+                "statusUrl": "http://YOUR_ESP32_IP/led/status",
+                "statusPattern": "\"saturation\":([0-9]+)",
+                "patternGroupToExtract": 1
+            },
+            "color": true,
+            "pullInterval": 5000
+        },
+        {
+            "accessory": "HTTP-SWITCH",
+            "name": "LED Mode Cycle",
+            "switchType": "stateless",
+            "onUrl": "http://YOUR_ESP32_IP/led/mode?bg=true"
+        },
+        {
+            "accessory": "HTTP-LIGHTBULB",
+            "name": "LED Sleep Timer",
+            "onUrl": "http://YOUR_ESP32_IP/led/on?bg=true",
+            "offUrl": "http://YOUR_ESP32_IP/led/off?bg=true",
+            "statusUrl": "http://YOUR_ESP32_IP/led/timer/status",
+            "brightness": {
+                "setUrl": "http://YOUR_ESP32_IP/led/timer?value=%s",
+                "statusUrl": "http://YOUR_ESP32_IP/led/timer/status"
+            },
+            "color": false,
+            "pullInterval": 5000
+        },
+        {
+            "accessory": "http-thermostat",
+            "name": "Air Conditioner",
+            "ip": "YOUR_ESP32_IP"
+        },
+        {
+            "accessory": "HTTP-SWITCH",
+            "name": "AC Mode Cycle",
+            "switchType": "stateless",
+            "onUrl": "http://YOUR_ESP32_IP/ac/mode?bg=true"
+        },
+        {
+            "accessory": "HTTP-FAN-V2",
+            "name": "AC Fan Level",
+            "pullInterval": 0,
+            "active": {
+                "onUrl": "http://YOUR_ESP32_IP/ac/fan/active",
+                "offUrl": "http://YOUR_ESP32_IP/ac/fan/active",
+                "statusUrl": "http://YOUR_ESP32_IP/ac/fan/active"
+            },
+            "rotationSpeed": {
+                "setUrl": "http://YOUR_ESP32_IP/ac/fan/speed?value=%s",
+                "statusUrl": "http://YOUR_ESP32_IP/ac/fan/speed/status"
+            }
+        },
+        {
+            "accessory": "HTTP-SWITCH",
+            "name": "AC Swing",
+            "onUrl": "http://YOUR_ESP32_IP/ac/swing?bg=true",
+            "offUrl": "http://YOUR_ESP32_IP/ac/swing?bg=true",
+            "statusUrl": "http://YOUR_ESP32_IP/led/status",
+            "pullInterval": 0
+        },
+        {
+            "accessory": "HTTP-SWITCH",
+            "name": "AC Eco Mode",
+            "onUrl": "http://YOUR_ESP32_IP/ac/eco?bg=true",
+            "offUrl": "http://YOUR_ESP32_IP/ac/eco?bg=true",
+            "statusUrl": "http://YOUR_ESP32_IP/led/status",
+            "pullInterval": 0
+        },
+        {
+            "accessory": "HTTP-LIGHTBULB",
+            "name": "AC Shutoff Timer",
+            "onUrl": "http://YOUR_ESP32_IP/ac/timer/on?bg=true",
+            "offUrl": "http://YOUR_ESP32_IP/ac/timer/off?bg=true",
+            "statusUrl": "http://YOUR_ESP32_IP/ac/timer/status",
+            "brightness": {
+                "setUrl": "http://YOUR_ESP32_IP/ac/timer?value=%s",
+                "statusUrl": "http://YOUR_ESP32_IP/ac/timer/status"
+            },
+            "color": false,
+            "pullInterval": 0
+        },
+        {
+            "accessory": "HTTP-SWITCH",
+            "name": "Light 1",
+            "onUrl": "http://YOUR_ESP32_IP/lamp/1/on",
+            "offUrl": "http://YOUR_ESP32_IP/lamp/1/off",
+            "statusUrl": "http://YOUR_ESP32_IP/lamp/1/status",
+            "statusPattern": "1",
+            "pullInterval": 5000
+        },
+        {
+            "accessory": "HTTP-SWITCH",
+            "name": "Light 2",
+            "onUrl": "http://YOUR_ESP32_IP/lamp/2/on",
+            "offUrl": "http://YOUR_ESP32_IP/lamp/2/off",
+            "statusUrl": "http://YOUR_ESP32_IP/lamp/2/status",
+            "statusPattern": "1",
+            "pullInterval": 5000
+        },
+        {
+            "accessory": "HTTP-SWITCH",
+            "name": "Light 3",
+            "onUrl": "http://YOUR_ESP32_IP/lamp/3/on",
+            "offUrl": "http://YOUR_ESP32_IP/lamp/3/off",
+            "statusUrl": "http://YOUR_ESP32_IP/lamp/3/status",
+            "statusPattern": "1",
+            "pullInterval": 5000
+        },
+        {
+            "accessory": "HTTP-SWITCH",
+            "name": "Light 4",
+            "onUrl": "http://YOUR_ESP32_IP/lamp/4/on",
+            "offUrl": "http://YOUR_ESP32_IP/lamp/4/off",
+            "statusUrl": "http://YOUR_ESP32_IP/lamp/4/status",
+            "statusPattern": "1",
+            "pullInterval": 5000
+        }
+    ],
+    "platforms": [
+        {
+            "name": "Config",
+            "platform": "config",
+            "port": 8581,
+            "theme": "red"
+        }
+    ]
+}

@@ -1,0 +1,9 @@
+# Custom AI Rules for Homekit Project
+
+# Context Integration
+The agent MUST always read and adhere to the setup details specified in [setup.md](file:///home/ghesso/homekit/setup.md) and security rules specified in [security.md](file:///home/ghesso/homekit/security.md).
+
+# Hard Security Constraint
+- Never recommend or implement configurations that open or forward ports on the public router.
+- All remote access designs must default to Tailscale or Cloudflare Tunnels (via `cloudflared`).
+- Ensure IoT components (such as ESP32 and local cameras) prioritize local-only communication to maintain strict privacy.

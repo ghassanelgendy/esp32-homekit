@@ -1,0 +1,56 @@
+# Node modules
+node_modules/
+homebridge_config/node_modules/
+
+# Local configuration files containing secrets/passwords
+homebridge_config/config.json
+homebridge_config/auth.json
+homebridge_config/.uix-secrets
+homebridge_config/.uix-dashboard.json
+docker-compose.yml
+secrets.h
+!secrets.example.h
+
+# Local documentation containing secrets (e.g. WiFi credentials)
+setup.md
+security.md
+*.md
+!README.md
+
+# Homebridge pairing, persistence, and logs
+homebridge_config/persist/
+homebridge_config/accessories/
+homebridge_config/backups/
+homebridge_config/homebridge.log
+
+# Camera-related files & directories
+frigate/
+homebridge_config/camera.ui/
+camera_clap_detector.py
+camera-clap-detector.service
+
+# APK binaries & installation files
+*.apk
+a.apk
+
+# Temporary files & copies
+root@192.168.1.*
+.DS_Store
+*.log
+
+# Mosquitto data and logs
+mosquitto/data/
+mosquitto/log/
+
+# TV and OwnTone related scripts, services, and configurations
+Dockerfile.owntone
+tv_control_server.py
+get_tv_state.sh
+launch_tv_app.sh
+airplay_autoheal.sh
+airplay_hijack.sh
+com.ghesso.airplay-hijack.plist
+homebridge_config/package.json
+update_dashboard.py
+!package.example.json
+

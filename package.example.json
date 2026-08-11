@@ -1,0 +1,15 @@
+{
+  "dependencies": {
+    "@piets/homebridge-http-thermostat": "^1.0.0",
+    "homebridge": "2.2.1",
+    "homebridge-http-fan": "^0.0.6",
+    "homebridge-http-fanv2": "^0.1.3",
+    "homebridge-http-lightbulb": "^1.2.4",
+    "homebridge-http-switch": "^0.5.36",
+    "homebridge-http-therm-temp": "^2.0.5",
+    "homebridge-http-thermostat-dummy": "^2.2.35",
+    "homebridge-web-thermostat": "^1.4.3",
+    "polling-to-event": "^2.1.0",
+    "request": "^2.88.2"
+  }
+}

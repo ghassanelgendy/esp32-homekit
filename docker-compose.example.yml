@@ -1,0 +1,41 @@
+services:
+  homebridge:
+    image: homebridge/homebridge:latest
+    container_name: homebridge
+    restart: always
+    network_mode: host
+    volumes:
+      - ./homebridge_config:/homebridge
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  owntone:
+    build:
+      context: .
+      dockerfile: Dockerfile.owntone
+    container_name: owntone
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    volumes:
+      - /var/run/avahi-daemon/socket:/var/run/avahi-daemon/socket
+      - ./owntone_config/owntone.conf:/etc/owntone/owntone.conf
+      - ./owntone_config/asound.conf:/etc/asound.conf
+      - ./owntone_cache:/var/cache/owntone
+      - ./Music:/music
+      - /mnt/sda5/Quran:/music/Quran
+      - /dev/snd:/dev/snd
+
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
