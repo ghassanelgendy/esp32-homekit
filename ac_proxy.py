@@ -84,11 +84,8 @@ def get_current_ac_state():
     if virtual_state_override is not None:
         return virtual_state_override != 0
     try:
-        discover_esp32()
-        url = f"http://{ESP32_IP}/status"
-        with urllib.request.urlopen(url, timeout=3) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            return data.get("targetHeatingCoolingState", 0) != 0
+        data = json.loads(fetch_esp32("/status").decode("utf-8"))
+        return data.get("targetHeatingCoolingState", 0) != 0
     except Exception as e:
         print(f"[AC Proxy] Error reading AC status: {e}")
         return False
@@ -96,11 +93,8 @@ def get_current_ac_state():
 def get_current_fan_state():
     """ Returns True if Fan is currently ON, False otherwise """
     try:
-        discover_esp32()
-        url = f"http://{ESP32_IP}/lamp/sunset/status"
-        with urllib.request.urlopen(url, timeout=3) as r:
-            res = r.read().decode("utf-8").strip()
-            return res == "1" or res.lower() == "true"
+        res = fetch_esp32("/lamp/sunset/status").decode("utf-8").strip()
+        return res == "1" or res.lower() == "true"
     except Exception as e:
         print(f"[AC Proxy] Error reading Fan status: {e}")
         return False
@@ -282,6 +276,43 @@ def discover_esp32():
                 return ESP32_IP
     return ESP32_IP
 
+esp32_io_lock = threading.Lock()
+_esp32_cache = {}
+ESP32_CACHE_TTL = 2.0
+
+def fetch_esp32(path, timeout=3):
+    """ GET `path` from the ESP32 with a short single-flight cache. HA polls
+    ~10 resources (several of them the same /status endpoint) every 5-10s, and
+    Homebridge polls independently on top of that -- but the ESP32 is a
+    single-threaded Arduino web server that can only serve one connection at
+    a time. Without this, several of those near-simultaneous polls would
+    collide, and whichever ones lost the race would time out waiting for a
+    connection the ESP32 hadn't gotten to yet. That showed up as the AC/Fan
+    randomly appearing to flicker off/restart every minute or so even though
+    nothing physically changed. Collapsing concurrent callers onto one cached
+    result (and serializing the real requests behind esp32_io_lock) fixes
+    that at the source instead of just tolerating the timeouts. """
+    global ESP32_IP
+    now = time.time()
+    cached = _esp32_cache.get(path)
+    if cached and now - cached[0] < ESP32_CACHE_TTL:
+        return cached[1]
+    with esp32_io_lock:
+        cached = _esp32_cache.get(path)
+        if cached and time.time() - cached[0] < ESP32_CACHE_TTL:
+            return cached[1]
+        url = f"http://{ESP32_IP}{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                data = r.read()
+        except Exception:
+            discover_esp32()
+            url = f"http://{ESP32_IP}{path}"
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                data = r.read()
+        _esp32_cache[path] = (time.time(), data)
+        return data
+
 def load_last_temp():
     global active_target_temp
     try:
@@ -381,15 +412,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                     data = json.dumps(res_json).encode("utf-8")
                 else:
-                    url = f"http://{ESP32_IP}/status"
-                    try:
-                        with urllib.request.urlopen(url, timeout=3) as r:
-                            data = r.read()
-                    except Exception:
-                        discover_esp32()
-                        url = f"http://{ESP32_IP}/status"
-                        with urllib.request.urlopen(url, timeout=3) as r:
-                            data = r.read()
+                    data = fetch_esp32("/status")
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -607,15 +630,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         else:
             try:
-                url = f"http://{ESP32_IP}{self.path}"
-                try:
-                    with urllib.request.urlopen(url, timeout=3) as r:
-                        data = r.read()
-                except Exception:
-                    discover_esp32()
-                    url = f"http://{ESP32_IP}{self.path}"
-                    with urllib.request.urlopen(url, timeout=3) as r:
-                        data = r.read()
+                data = fetch_esp32(self.path)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
