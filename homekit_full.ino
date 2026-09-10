@@ -322,6 +322,15 @@ void setup() {
   irsendAC.begin();
   irsendLED.begin();
 
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // Disable WiFi modem-sleep power saving -- with it on (the
+                          // ESP32 default), this board would silently drop off WiFi
+                          // for 1-3 minutes at a time and only recover once its
+                          // internal auto-reconnect eventually kicked in. That showed
+                          // up as the AC/Fan/lights going completely unreachable for
+                          // a couple minutes even though nothing on the network side
+                          // had changed.
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -719,9 +728,28 @@ void setup() {
   server.begin();
 }
 
+unsigned long last_wifi_check_time = 0;
+const unsigned long WIFI_CHECK_INTERVAL_MS = 5000UL;
+
 void loop() {
   server.handleClient();
   ArduinoOTA.handle();
+
+  // --- WiFi Reconnect Watchdog ---
+  // setup() only calls WiFi.begin() once at boot; if the connection ever drops for
+  // any reason after that (router hiccup, brief interference, etc.), nothing used to
+  // notice or retry, leaving this device relying solely on the ESP32 core's own
+  // internal auto-reconnect timing to come back -- which is what produced multi-
+  // minute outages. Checked every 5s (cheap, no blocking delay()) so a real drop is
+  // caught and retried within seconds instead.
+  if (millis() - last_wifi_check_time >= WIFI_CHECK_INTERVAL_MS) {
+    last_wifi_check_time = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected -- reconnecting...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+    }
+  }
 
   // --- AC Background Timer ---
   if (timer_active && (millis() - timer_start_time >= timer_duration_ms)) {
