@@ -60,7 +60,9 @@ def set_ac_raw_state(state):
         discover_esp32()
         url = f"http://{ESP32_IP}/targetHeatingCoolingState?value={state}"
         with urllib.request.urlopen(url, timeout=10) as r:
-            return r.read()
+            result = r.read()
+        _esp32_cache.clear()
+        return result
     except Exception as e:
         print(f"[AC Proxy] Error setting raw AC state {state}: {e}")
 
@@ -74,7 +76,9 @@ def set_fan_raw_state(state):
         endpoint = "on" if state == 1 else "off"
         url = f"http://{ESP32_IP}/lamp/sunset/{endpoint}"
         with urllib.request.urlopen(url, timeout=10) as r:
-            return r.read()
+            result = r.read()
+        _esp32_cache.clear()
+        return result
     except Exception as e:
         print(f"[AC Proxy] Error setting fan state {state}: {e}")
 
@@ -278,7 +282,9 @@ def discover_esp32():
 
 esp32_io_lock = threading.Lock()
 _esp32_cache = {}
-ESP32_CACHE_TTL = 2.0
+ESP32_CACHE_TTL = 8.0  # comfortably longer than one full background-poller cycle
+                       # (9 paths x ~0.5-1s each) so client requests always hit the
+                       # warm cache instead of racing the poller into their own live call
 
 def fetch_esp32(path, timeout=3):
     """ GET `path` from the ESP32 with a short single-flight cache. HA polls
@@ -630,7 +636,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         else:
             try:
-                data = fetch_esp32(self.path)
+                # Only cache/dedupe true status reads. Everything else falling through
+                # to here is a one-shot action (e.g. /lamp/main/on, /ac/swing,
+                # /ac/timer/on) -- caching those would silently swallow a second
+                # real command sent within the cache TTL instead of executing it.
+                if self.path.split("?", 1)[0].endswith("/status"):
+                    data = fetch_esp32(self.path)
+                else:
+                    url = f"http://{ESP32_IP}{self.path}"
+                    try:
+                        with urllib.request.urlopen(url, timeout=5) as r:
+                            data = r.read()
+                    except Exception:
+                        discover_esp32()
+                        url = f"http://{ESP32_IP}{self.path}"
+                        with urllib.request.urlopen(url, timeout=5) as r:
+                            data = r.read()
+                    # This action just changed real device state (e.g. a lamp/LED/timer
+                    # toggle) -- drop the whole status cache so the very next status
+                    # read (from any client) reflects it immediately instead of
+                    # possibly serving a pre-action cached value for up to
+                    # ESP32_CACHE_TTL seconds. The background poller repopulates it
+                    # within its next pass regardless.
+                    _esp32_cache.clear()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
@@ -750,8 +778,45 @@ def run_hard_calibration(target_temp):
         finally:
             is_calibrating = False
 
+STATUS_POLL_PATHS = [
+    "/status",
+    "/ac/timer/status",
+    "/ac/swing/status",
+    "/ac/eco/status",
+    "/lamp/main/status",
+    "/lamp/fairy/status",
+    "/lamp/backlight/status",
+    "/lamp/sunset/status",
+    "/led/status",
+    "/led/timer/status",
+]
+
+def esp32_background_poller():
+    """ Keep the ESP32 status cache warm with one slow, serialized request stream
+    instead of letting client requests trigger the live ESP32 calls directly. HA
+    polls several resources every 5-10s, and Homebridge polls its ~15 accessories
+    independently -- several of the plugins involved (e.g. homebridge-http-thermostat)
+    default to a 60-SECOND poll interval when none is configured, and because those
+    accessories all started around the same time, their timers fire together: a burst
+    of ~9 different requests hitting the ESP32 at the same instant, once a minute.
+    The ESP32 is a single-threaded Arduino web server -- it can only accept one
+    connection at a time -- and that burst was enough to make it drop off the
+    network outright for several seconds, which is what looked like the AC/Fan
+    randomly restarting every minute. With this loop running, the proxy is the
+    ESP32's only real client: it sees one paced request at a time, and every
+    external caller (HA, Homebridge) always gets an instant answer from cache no
+    matter how many of them ask or how bursty/synchronized their own polling is. """
+    while True:
+        for path in STATUS_POLL_PATHS:
+            try:
+                fetch_esp32(path)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
 def main():
     print(f"Starting AC Proxy Server on port {PORT}...")
+    threading.Thread(target=esp32_background_poller, daemon=True).start()
     # Threading server: a slow/blocking ESP32 call (e.g. mid power-on calibration,
     # or a flaky WiFi moment) must not stall every OTHER accessory's status poll --
     # a single-threaded HTTPServer processes one request at a time, so one slow
