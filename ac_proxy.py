@@ -631,14 +631,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Route the Fan (lamp/fan) power endpoints through the proxy so that turning
         # the Fan off manually can also opt the swap out, the same way the AC does.
         elif path in ("/lamp/fan/on", "/lamp/fan/off"):
-            # Same redundant-resync guard as the AC side above: only stop the swap if the
-            # Fan was actually ON before this "off" arrived. During the swap's "ac" phase
-            # the Fan is already off, and HA re-affirming that state must not kill the swap.
-            if path == "/lamp/fan/off" and swap_active and get_current_fan_state():
+            # Only stop the swap if the Fan was actually ON before this "off" arrived.
+            # Check cached state directly to avoid blocking network I/O before command execution!
+            fan_was_on = False
+            cached_fan = _esp32_cache.get("/lamp/fan/status")
+            if cached_fan:
+                fan_was_on = cached_fan[1] == b"1" or cached_fan[1].lower() == b"true"
+            else:
+                fan_was_on = True # default assume on if unknown
+
+            if path == "/lamp/fan/off" and swap_active and fan_was_on:
                 print("[AC Proxy] Fan manually turned OFF while swap active -> stopping swap.")
                 stop_ac_fan_swap()
             try:
-                data = send_esp32_cmd(path, timeout=5)
+                data = send_esp32_cmd(path, timeout=3.0, retries=2)
                 # Optimistically update fan status cache
                 _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if path == "/lamp/fan/on" else b"0")
                 self.send_response(200)
