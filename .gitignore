@@ -4,6 +4,7 @@ homebridge_config/node_modules/
 
 # Local configuration files containing secrets/passwords
 homebridge_config/config.json
+homebridge_config/config.json.bak-*
 homebridge_config/auth.json
 homebridge_config/.uix-secrets
 homebridge_config/.uix-dashboard.json
@@ -37,6 +38,8 @@ a.apk
 root@192.168.1.*
 .DS_Store
 *.log
+__pycache__/
+ac_proxy_data/
 
 # Mosquitto data and logs
 mosquitto/data/
