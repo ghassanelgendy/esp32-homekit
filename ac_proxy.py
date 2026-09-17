@@ -207,11 +207,19 @@ def ac_fan_swap_loop(minutes):
                     last_phase_time = time.time() - (target_seconds - 10.0)
                     continue
                 time.sleep(1.0)
-                set_fan_raw_state(1, retries=4)
+                fan_res = set_fan_raw_state(1, retries=4)
+                if fan_res is None:
+                    print("[AC Proxy] WARNING: Failed to turn Fan ON during swap! Retrying in 10s...")
+                    last_phase_time = time.time() - (target_seconds - 10.0)
+                    continue
                 current_phase = "fan"
             else:
                 print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning Fan OFF, AC ON (Phase: Fan -> AC)...")
-                set_fan_raw_state(0, retries=4)
+                fan_res = set_fan_raw_state(0, retries=4)
+                if fan_res is None:
+                    print("[AC Proxy] WARNING: Failed to turn Fan OFF during swap! ABORTING AC activation to prevent both running. Retrying in 10s...")
+                    last_phase_time = time.time() - (target_seconds - 10.0)
+                    continue
                 time.sleep(1.0)
                 ac_res = set_ac_raw_state(2, retries=4)
                 if ac_res is None:
