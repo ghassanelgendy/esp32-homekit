@@ -75,47 +75,154 @@ def get_ac_phase_minutes():
     change also rescales the AC phase, not just the Fan phase. """
     return max(AC_PHASE_MIN_MINUTES, min(AC_PHASE_MAX_MINUTES, swap_interval_minutes * AC_PHASE_RATIO))
 
-def set_ac_raw_state(state, retries=3):
-    """ Turn AC state ON (2) or OFF (0) using targetHeatingCoolingState route on ESP32 with retries """
-    global virtual_state_override
-    url = f"http://{ESP32_IP}/targetHeatingCoolingState?value={state}"
-    last_err = None
-    for attempt in range(retries):
+esp32_io_lock = threading.Lock()
+_esp32_cache = {}
+ESP32_CACHE_TTL = 30.0  # seconds
+
+def fetch_esp32(path, timeout=2.0):
+    global ESP32_IP
+    now = time.time()
+    cached = _esp32_cache.get(path)
+
+    # 1. Fast path: Fresh cache hit
+    if cached and (now - cached[0] < ESP32_CACHE_TTL):
+        return cached[1]
+
+    # 2. Fast path: If requesting an individual lamp status, check bulk /lamps/status cache
+    if path.startswith("/lamp/") and path.endswith("/status"):
+        lamps_cached = _esp32_cache.get("/lamps/status")
+        if lamps_cached and (now - lamps_cached[0] < ESP32_CACHE_TTL):
+            try:
+                data = json.loads(lamps_cached[1].decode("utf-8"))
+                for k, v in data.items():
+                    _esp32_cache[f"/lamp/{k}/status"] = (lamps_cached[0], b"1" if v else b"0")
+                if path in _esp32_cache:
+                    return _esp32_cache[path][1]
+            except Exception:
+                pass
+
+    # 3. Never block during calibration - serve cached or safe fallback
+    if is_calibrating:
+        if cached:
+            return cached[1]
+        return b"{}" if path.endswith("/status") and "lamp" not in path else b"0"
+
+    # 4. Non-blocking lock acquisition:
+    # If the lock is held (e.g. action command in flight), NEVER stall client threads!
+    # Return stale cached data immediately if available.
+    acquired = esp32_io_lock.acquire(blocking=False)
+    if not acquired:
+        if cached:
+            return cached[1]
+        # Only wait briefly if we have never retrieved this endpoint before
+        if not esp32_io_lock.acquire(timeout=1.5):
+            if cached:
+                return cached[1]
+            raise TimeoutError(f"ESP32 busy on {path}")
+
+    try:
+        # Re-check cache in case another thread just updated it
+        cached = _esp32_cache.get(path)
+        if cached and (time.time() - cached[0] < ESP32_CACHE_TTL):
+            return cached[1]
+
+        url = f"http://{ESP32_IP}{path}"
         try:
-            with esp32_io_lock:
-                with urllib.request.urlopen(url, timeout=6) as r:
-                    result = r.read()
-            _esp32_cache.pop("/status", None)
-            virtual_state_override = int(state)
-            return result
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                data = r.read()
+            t = time.time()
+            _esp32_cache[path] = (t, data)
+
+            # If bulk lamps status was fetched, populate individual caches
+            if path == "/lamps/status":
+                try:
+                    pdata = json.loads(data.decode("utf-8"))
+                    for k, v in pdata.items():
+                        _esp32_cache[f"/lamp/{k}/status"] = (t, b"1" if v else b"0")
+                except Exception:
+                    pass
+
+            return data
+        except Exception as e:
+            if cached:
+                return cached[1]
+            if path == "/lamps/status":
+                return b'{"main":false,"fairy":false,"fan":false,"backlight":false}'
+            elif path.startswith("/lamp/") or path.startswith("/led/"):
+                return b"0"
+            elif path == "/status":
+                return json.dumps({
+                    "targetTemperature": float(active_target_temp),
+                    "currentTemperature": float(active_target_temp),
+                    "targetHeatingCoolingState": 0,
+                    "currentHeatingCoolingState": 0
+                }).encode("utf-8")
+            raise e
+    finally:
+        esp32_io_lock.release()
+
+def send_esp32_cmd(path, timeout=2.5, retries=2):
+    """ Send an action command to the ESP32 synchronized with esp32_io_lock, with retries. """
+    global ESP32_IP
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            url = f"http://{ESP32_IP}{path}"
+            # Acquire lock with a generous wait so action commands always get through
+            if not esp32_io_lock.acquire(timeout=8.0):
+                raise TimeoutError("ESP32 lock busy")
+            try:
+                with urllib.request.urlopen(url, timeout=timeout) as r:
+                    data = r.read()
+                    # Optimistically update status cache immediately
+                    now = time.time()
+                    base = path.split("?", 1)[0]
+                    if base.startswith("/lamp/") and (base.endswith("/on") or base.endswith("/off")):
+                        parts = base.split("/")
+                        if len(parts) >= 4:
+                            lamp_name = parts[2]
+                            st = b"1" if base.endswith("/on") else b"0"
+                            _esp32_cache[f"/lamp/{lamp_name}/status"] = (now, st)
+                            _esp32_cache.pop("/lamps/status", None)
+                    elif base.startswith("/led/") and (base.endswith("/on") or base.endswith("/off")):
+                        st = b"1" if base.endswith("/on") else b"0"
+                        _esp32_cache["/led/status"] = (now, st)
+                    return data
+            finally:
+                esp32_io_lock.release()
         except Exception as e:
             last_err = e
-            time.sleep(0.8)
-    print(f"[AC Proxy] Error setting raw AC state {state} after {retries} attempts: {last_err}")
-    return None
+            if attempt < retries:
+                time.sleep(0.15)
+    raise last_err
+
+def set_ac_raw_state(state, retries=2):
+    """ Turn AC state ON (2) or OFF (0) using targetHeatingCoolingState route on ESP32 with retries """
+    global virtual_state_override
+    try:
+        result = send_esp32_cmd(f"/targetHeatingCoolingState?value={state}", timeout=2.5, retries=retries)
+        _esp32_cache.pop("/status", None)
+        virtual_state_override = int(state)
+        return result
+    except Exception as e:
+        print(f"[AC Proxy] Error setting raw AC state {state} after {retries} attempts: {e}")
+        return None
 
 def set_ac_memory_only(state):
     """ Sync state tracking memory """
     pass
 
-def set_fan_raw_state(state, retries=3):
+def set_fan_raw_state(state, retries=2):
     """ Turn Fan ON (1) or OFF (0) using the ESP32's fan relay endpoint with retries """
     endpoint = "on" if state == 1 else "off"
-    url = f"http://{ESP32_IP}/lamp/fan/{endpoint}"
-    last_err = None
-    for attempt in range(retries):
-        try:
-            with esp32_io_lock:
-                with urllib.request.urlopen(url, timeout=6) as r:
-                    result = r.read()
-            _esp32_cache.pop("/lamp/fan/status", None)
-            _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if state == 1 else b"0")
-            return result
-        except Exception as e:
-            last_err = e
-            time.sleep(0.8)
-    print(f"[AC Proxy] Error setting fan state {state} after {retries} attempts: {last_err}")
-    return None
+    try:
+        result = send_esp32_cmd(f"/lamp/fan/{endpoint}", timeout=2.5, retries=retries)
+        _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if state == 1 else b"0")
+        _esp32_cache.pop("/lamps/status", None)
+        return result
+    except Exception as e:
+        print(f"[AC Proxy] Error setting fan state {state} after {retries} attempts: {e}")
+        return None
 
 def get_current_ac_state():
     """ Returns True if AC is currently ON (state != 0), False otherwise """
@@ -332,67 +439,6 @@ def discover_esp32():
                 print(f"[AC Proxy] Discovered ESP32 at new IP: {ESP32_IP}")
                 return ESP32_IP
     return ESP32_IP
-
-esp32_io_lock = threading.Lock()
-_esp32_cache = {}
-ESP32_CACHE_TTL = 30.0 # Keep cache warm across background poller cycles (10 paths x 0.8s = 8s)
-
-def fetch_esp32(path, timeout=3):
-    global ESP32_IP
-    now = time.time()
-    cached = _esp32_cache.get(path)
-    if cached and now - cached[0] < ESP32_CACHE_TTL:
-        return cached[1]
-    
-    # If the lock is held (e.g. calibration IR blasting or another request),
-    # do NOT stall client threads! Return cached data immediately if available.
-    acquired = esp32_io_lock.acquire(timeout=0.3)
-    if not acquired:
-        if cached:
-            return cached[1]
-        # Only wait if we have never retrieved this endpoint before
-        if not esp32_io_lock.acquire(timeout=4.0):
-            if cached:
-                return cached[1]
-            raise TimeoutError(f"ESP32 busy on {path}")
-
-    try:
-        cached = _esp32_cache.get(path)
-        if cached and time.time() - cached[0] < ESP32_CACHE_TTL:
-            return cached[1]
-        url = f"http://{ESP32_IP}{path}"
-        try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                data = r.read()
-        except Exception as e:
-            if cached:
-                return cached[1]
-            raise e
-        _esp32_cache[path] = (time.time(), data)
-        return data
-    finally:
-        esp32_io_lock.release()
-
-def send_esp32_cmd(path, timeout=3.0, retries=2):
-    """ Send an action command to the ESP32 synchronized with esp32_io_lock, with retries. """
-    global ESP32_IP
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            url = f"http://{ESP32_IP}{path}"
-            # Acquire lock with a bounded wait
-            if not esp32_io_lock.acquire(timeout=4.0):
-                raise TimeoutError("ESP32 lock busy")
-            try:
-                with urllib.request.urlopen(url, timeout=timeout) as r:
-                    return r.read()
-            finally:
-                esp32_io_lock.release()
-        except Exception as e:
-            last_err = e
-            if attempt < retries:
-                time.sleep(0.2)
-    raise last_err
 
 def load_last_temp():
     global active_target_temp
@@ -644,9 +690,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 print("[AC Proxy] Fan manually turned OFF while swap active -> stopping swap.")
                 stop_ac_fan_swap()
             try:
-                data = send_esp32_cmd(path, timeout=3.0, retries=2)
+                data = send_esp32_cmd(path, timeout=2.5, retries=2)
                 # Optimistically update fan status cache
                 _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if path == "/lamp/fan/on" else b"0")
+                _esp32_cache.pop("/lamps/status", None)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
@@ -666,7 +713,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"OK")
             else:
                 try:
-                    data = send_esp32_cmd(f"/targetTemperature?value={val}", timeout=5)
+                    data = send_esp32_cmd(f"/targetTemperature?value={val}", timeout=2.5, retries=2)
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain")
                     self.end_headers()
@@ -697,7 +744,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     target_level = 3
                 save_fan_level(target_level)
                 try:
-                    send_esp32_cmd(f"/ac/fan/speed?value={val}", timeout=5)
+                    send_esp32_cmd(f"/ac/fan/speed?value={val}", timeout=2.5, retries=2)
                 except Exception as e:
                     print(f"[AC Proxy] Error forwarding fan speed set: {e}")
             self.send_response(200)
@@ -709,7 +756,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # its resulting level back into our cache so /ac/fan/speed/status stays in sync.
         elif path == "/ac/fan":
             try:
-                data = send_esp32_cmd("/ac/fan", timeout=5)
+                data = send_esp32_cmd("/ac/fan", timeout=2.5, retries=2)
                 try:
                     save_fan_level(int(data.decode().strip()))
                 except Exception:
@@ -726,10 +773,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 # Only cache/dedupe true status reads. Everything else falling through
                 # to here is a one-shot action (e.g. /lamp/main/on, /ac/swing,
                 # /ac/timer/on)
-                if self.path.split("?", 1)[0].endswith("/status"):
+                base_clean = self.path.split("?", 1)[0]
+                if base_clean.endswith("/status") or base_clean == "/lamps/status":
                     data = fetch_esp32(self.path)
                 else:
-                    data = send_esp32_cmd(self.path, timeout=5)
+                    data = send_esp32_cmd(self.path, timeout=2.5, retries=2)
                     # Optimistically update cache and invalidate stale keys
                     base = self.path.split("?", 1)[0]
                     _esp32_cache.pop(base, None)
@@ -751,7 +799,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                if self.path.split("?", 1)[0].endswith("/status"):
+                base_clean = self.path.split("?", 1)[0]
+                if base_clean.endswith("/status") or base_clean == "/lamps/status":
                     cached = _esp32_cache.get(self.path)
                     if cached:
                         try:
@@ -759,6 +808,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             self.send_header("Content-Type", "text/plain")
                             self.end_headers()
                             self.wfile.write(cached[1])
+                            return
+                        except Exception:
+                            return
+                    else:
+                        try:
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/plain")
+                            self.end_headers()
+                            fallback = b'{"main":false,"fairy":false,"fan":false,"backlight":false}' if base_clean == "/lamps/status" else b"0"
+                            self.wfile.write(fallback)
                             return
                         except Exception:
                             return
@@ -865,32 +924,74 @@ def run_hard_calibration(target_temp):
         finally:
             is_calibrating = False
 
-STATUS_POLL_PATHS = [
-    "/status",
-    "/ac/timer/status",
-    "/ac/swing/status",
-    "/ac/eco/status",
-    "/lamp/main/status",
-    "/lamp/fairy/status",
-    "/lamp/backlight/status",
-    "/lamp/fan/status",
-    "/led/status",
-    "/led/timer/status",
-]
-
 def esp32_background_poller():
     consecutive_failures = 0
     while True:
-        for path in STATUS_POLL_PATHS:
-            try:
-                fetch_esp32(path)
-                consecutive_failures = 0
-            except Exception:
-                consecutive_failures += 1
-                if consecutive_failures >= 15:
-                    discover_esp32()
+        try:
+            if is_calibrating:
+                time.sleep(2.0)
+                continue
+
+            # 1. Bulk Poll /lamps/status (updates main, fairy, fan, backlight simultaneously)
+            if esp32_io_lock.acquire(blocking=False):
+                try:
+                    url = f"http://{ESP32_IP}/lamps/status"
+                    with urllib.request.urlopen(url, timeout=2.0) as r:
+                        raw = r.read()
+                    data = json.loads(raw.decode("utf-8"))
+                    t = time.time()
+                    _esp32_cache["/lamps/status"] = (t, raw)
+                    if "main" in data:
+                        _esp32_cache["/lamp/main/status"] = (t, b"1" if data["main"] else b"0")
+                    if "fairy" in data:
+                        _esp32_cache["/lamp/fairy/status"] = (t, b"1" if data["fairy"] else b"0")
+                    if "fan" in data:
+                        _esp32_cache["/lamp/fan/status"] = (t, b"1" if data["fan"] else b"0")
+                    if "backlight" in data:
+                        _esp32_cache["/lamp/backlight/status"] = (t, b"1" if data["backlight"] else b"0")
                     consecutive_failures = 0
-            time.sleep(1.5)
+                except Exception:
+                    consecutive_failures += 1
+                finally:
+                    esp32_io_lock.release()
+
+            time.sleep(2.0)
+
+            # 2. Poll /status (AC Thermostat)
+            if not is_calibrating and esp32_io_lock.acquire(blocking=False):
+                try:
+                    url = f"http://{ESP32_IP}/status"
+                    with urllib.request.urlopen(url, timeout=2.0) as r:
+                        raw = r.read()
+                    _esp32_cache["/status"] = (time.time(), raw)
+                    consecutive_failures = 0
+                except Exception:
+                    consecutive_failures += 1
+                finally:
+                    esp32_io_lock.release()
+
+            time.sleep(2.0)
+
+            # 3. Poll /led/status
+            if not is_calibrating and esp32_io_lock.acquire(blocking=False):
+                try:
+                    url = f"http://{ESP32_IP}/led/status"
+                    with urllib.request.urlopen(url, timeout=2.0) as r:
+                        raw = r.read()
+                    _esp32_cache["/led/status"] = (time.time(), raw)
+                    consecutive_failures = 0
+                except Exception:
+                    consecutive_failures += 1
+                finally:
+                    esp32_io_lock.release()
+
+            if consecutive_failures >= 15:
+                discover_esp32()
+                consecutive_failures = 0
+
+            time.sleep(2.0)
+        except Exception:
+            time.sleep(2.0)
 
 def main():
     print(f"Starting AC Proxy Server on port {PORT}...")
