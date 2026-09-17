@@ -138,6 +138,7 @@ void handleLampsStatus() {
   String json = "{";
   json += "\"main\":" + String(lampMainState ? "true" : "false") + ",";
   json += "\"fairy\":" + String(lampFairyState ? "true" : "false") + ",";
+  json += "\"fan\":" + String(lampSunsetState ? "true" : "false") + ",";
   json += "\"sunset\":" + String(lampSunsetState ? "true" : "false") + ",";
   json += "\"backlight\":" + String(lampBackState ? "true" : "false");
   json += "}";
