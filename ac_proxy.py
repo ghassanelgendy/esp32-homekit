@@ -373,20 +373,25 @@ def fetch_esp32(path, timeout=3):
     finally:
         esp32_io_lock.release()
 
-def send_esp32_cmd(path, timeout=3.5, retries=1):
+def send_esp32_cmd(path, timeout=3.0, retries=2):
     """ Send an action command to the ESP32 synchronized with esp32_io_lock, with retries. """
     global ESP32_IP
     last_err = None
     for attempt in range(retries + 1):
         try:
             url = f"http://{ESP32_IP}{path}"
-            with esp32_io_lock:
+            # Acquire lock with a bounded wait
+            if not esp32_io_lock.acquire(timeout=4.0):
+                raise TimeoutError("ESP32 lock busy")
+            try:
                 with urllib.request.urlopen(url, timeout=timeout) as r:
                     return r.read()
+            finally:
+                esp32_io_lock.release()
         except Exception as e:
             last_err = e
             if attempt < retries:
-                time.sleep(0.3)
+                time.sleep(0.2)
     raise last_err
 
 def load_last_temp():
@@ -879,7 +884,7 @@ def esp32_background_poller():
                 if consecutive_failures >= 15:
                     discover_esp32()
                     consecutive_failures = 0
-            time.sleep(0.8)
+            time.sleep(1.5)
 
 def main():
     print(f"Starting AC Proxy Server on port {PORT}...")
