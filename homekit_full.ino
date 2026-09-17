@@ -24,12 +24,12 @@ WebServer server(80);
 // by kIrAcPin (the AC IR transmitter) in this sketch.
 const int relayMain    = 25;  // Lamp 1 - Main
 const int relayFairy   = 26;  // Lamp 2 - Fairy Light
-const int relaySunset  = 33;  // Lamp 3 - Sunset Light
+const int relayFan     = 33;  // Relay 3 - Fan
 const int relayBack    = 32;  // Lamp 4 - Backlight
 
 bool lampMainState   = false;
 bool lampFairyState  = false;
-bool lampSunsetState = false;
+bool lampFanState    = false;
 bool lampBackState   = false;
 
 // --- AC state tracking variables ---
@@ -133,13 +133,12 @@ void setLamp(int pin, bool &stateVar, bool on) {
   stateVar = on;
 }
 
-// Endpoint: GET /lamps/status -> JSON status of all 4 lamps
+// Endpoint: GET /lamps/status -> JSON status of relays
 void handleLampsStatus() {
   String json = "{";
   json += "\"main\":" + String(lampMainState ? "true" : "false") + ",";
   json += "\"fairy\":" + String(lampFairyState ? "true" : "false") + ",";
-  json += "\"fan\":" + String(lampSunsetState ? "true" : "false") + ",";
-  json += "\"sunset\":" + String(lampSunsetState ? "true" : "false") + ",";
+  json += "\"fan\":" + String(lampFanState ? "true" : "false") + ",";
   json += "\"backlight\":" + String(lampBackState ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
@@ -289,13 +288,13 @@ void setup() {
   // --- Relay / Lamp pin setup ---
   pinMode(relayMain, OUTPUT);
   pinMode(relayFairy, OUTPUT);
-  pinMode(relaySunset, OUTPUT);
+  pinMode(relayFan, OUTPUT);
   pinMode(relayBack, OUTPUT);
 
   // Set all relays HIGH (OFF) by default so they don't turn on during boot
   digitalWrite(relayMain, HIGH);
   digitalWrite(relayFairy, HIGH);
-  digitalWrite(relaySunset, HIGH);
+  digitalWrite(relayFan, HIGH);
   digitalWrite(relayBack, HIGH);
 
   // Initialize both IR transmitters
@@ -592,7 +591,7 @@ void setup() {
     server.send(200, "text/plain", String(responsePct));
   });
 
-  // --- Lamp / Relay Endpoints (Main, Fairy Light, Sunset Light, Backlight) ---
+  // --- Lamp / Relay Endpoints (Main, Fairy Light, Fan, Backlight) ---
   server.on("/lamps/status", HTTP_GET, handleLampsStatus);
 
   // Main
@@ -621,30 +620,17 @@ void setup() {
     server.send(200, "text/plain", lampFairyState ? "1" : "0");
   });
 
-  // Sunset Light
-  server.on("/lamp/sunset/on", HTTP_GET, []() {
-    setLamp(relaySunset, lampSunsetState, true);
-    server.send(200, "text/plain", "1");
-  });
-  server.on("/lamp/sunset/off", HTTP_GET, []() {
-    setLamp(relaySunset, lampSunsetState, false);
-    server.send(200, "text/plain", "0");
-  });
-  server.on("/lamp/sunset/status", HTTP_GET, []() {
-    server.send(200, "text/plain", lampSunsetState ? "1" : "0");
-  });
-
-  // Fan (Relay on GPIO 33)
+  // Fan (Relay 3 on GPIO 33)
   server.on("/lamp/fan/on", HTTP_GET, []() {
-    setLamp(relaySunset, lampSunsetState, true);
+    setLamp(relayFan, lampFanState, true);
     server.send(200, "text/plain", "1");
   });
   server.on("/lamp/fan/off", HTTP_GET, []() {
-    setLamp(relaySunset, lampSunsetState, false);
+    setLamp(relayFan, lampFanState, false);
     server.send(200, "text/plain", "0");
   });
   server.on("/lamp/fan/status", HTTP_GET, []() {
-    server.send(200, "text/plain", lampSunsetState ? "1" : "0");
+    server.send(200, "text/plain", lampFanState ? "1" : "0");
   });
 
   // Backlight
