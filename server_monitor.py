@@ -65,8 +65,12 @@ def get_journal_boots():
         return []
 
 def check_internet(timeout=1.5):
-    """Fast check for internet connectivity via DNS port 53 (Cloudflare & Google)."""
-    endpoints = [("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)]
+    """Fast check for internet connectivity via DNS port 53 (Cloudflare & Google & Quad9)."""
+    endpoints = [
+        (os.environ.get("DNS_HOST_1", "one.one.one.one"), 53),
+        (os.environ.get("DNS_HOST_2", "dns.google"), 53),
+        (os.environ.get("DNS_HOST_3", "dns.quad9.net"), 53),
+    ]
     for host, port in endpoints:
         try:
             s = socket.create_connection((host, port), timeout=timeout)

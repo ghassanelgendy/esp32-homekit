@@ -14,7 +14,8 @@ import time
 import urllib.request
 import urllib.error
 
-OWNTONE_API = "http://192.168.1.100:3689/api"
+OWNTONE_HOST = os.environ.get("OWNTONE_HOST", "localhost")
+OWNTONE_API = f"http://{OWNTONE_HOST}:3689/api"
 AIRPLAY_OUTPUT_ID = "26612976694777"  # "The Room" (iPhone 4S)
 DEFAULT_VOLUME = 30
 HOLD_DURATION = 7200  # 2 hours in seconds

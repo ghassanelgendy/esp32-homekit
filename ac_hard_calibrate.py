@@ -14,8 +14,10 @@ import urllib.request
 import urllib.parse
 import json
 
-ESP32_IP = "192.168.1.140"
-PROXY_URL = "http://127.0.0.1:8880"
+ESP32_HOST = os.environ.get("ESP32_HOST", "esp32.local")
+PROXY_HOST = os.environ.get("PROXY_HOST", "localhost")
+ESP32_IP = ESP32_HOST
+PROXY_URL = f"http://{PROXY_HOST}:8880"
 
 def get_current_target():
     try:

@@ -13,8 +13,9 @@ PLAYLIST_NAME = "quran_all"
 PLAYLIST_FILE = f"{PLAYLIST_NAME}.m3u"
 PLAYLIST_PATH = os.path.join(MUSIC_DIR, PLAYLIST_FILE)
 
-OWNTONE_API = "http://192.168.1.100:3689/api"
-OWNTONE_MPD_HOST = "192.168.1.100"
+OWNTONE_HOST = os.environ.get("OWNTONE_HOST", "localhost")
+OWNTONE_API = f"http://{OWNTONE_HOST}:3689/api"
+OWNTONE_MPD_HOST = OWNTONE_HOST
 OWNTONE_MPD_PORT = 6600
 
 def wait_for_port(host, port, timeout=120):
