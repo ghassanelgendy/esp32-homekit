@@ -119,20 +119,6 @@ void sendAcIR(uint32_t hexCode) {
   digitalWrite(LED_PIN, LOW);
 }
 
-// The AC remote has a single toggle code for power (no discrete on/off), and with
-// no feedback path (no IR echo, no current sensor) a dropped blast permanently
-// desyncs targetHeatingCoolingState from the physical unit until someone notices.
-// Sending one extra NEC repeat frame after the base code improves the odds the AC
-// actually receives it, without risking a double-toggle: a NEC repeat frame is a
-// distinct, shorter signal that compliant receivers treat as "still holding the
-// same button," not as a second independent press.
-void sendAcPower(uint32_t hexCode) {
-  digitalWrite(LED_PIN, HIGH);
-  irsendAC.sendNEC(hexCode, 32, 1);
-  delay(100);
-  digitalWrite(LED_PIN, LOW);
-}
-
 void sendLedIR(uint32_t hexCode) {
   digitalWrite(LED_PIN, HIGH);
   irsendLED.sendNEC(hexCode, 32);
@@ -222,17 +208,10 @@ void handleSetTargetState() {
   if (server.hasArg("value")) {
     int newState = server.arg("value").toInt();
 
-    // Only send IR power code if state is actually changing (0 -> on, or on -> 0).
-    // Sending it unconditionally desyncs physical AC power from tracked state
-    // whenever this endpoint is called redundantly (e.g. HomeKit re-affirming
-    // the same state, or the AC/Fan swap loop re-checking status).
-    if ((newState == 0 && targetHeatingCoolingState != 0) || (newState != 0 && targetHeatingCoolingState == 0)) {
-      sendAcPower(AC_CODE_POWER);
-      Serial.printf("IR: Transmitted AC power command (state: %d -> %d)\n", targetHeatingCoolingState, newState);
-    } else {
-      Serial.printf("State update: Updated target state to %d without IR power toggle\n", newState);
-    }
+    // Always trigger the IR toggle code to guarantee execution
+    sendAcIR(AC_CODE_POWER);
     targetHeatingCoolingState = newState;
+    Serial.printf("IR: Transmitted AC power command (state: %d)\n", newState);
   }
   server.send(200, "text/plain", "OK");
 }
@@ -322,15 +301,6 @@ void setup() {
   irsendAC.begin();
   irsendLED.begin();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);  // Disable WiFi modem-sleep power saving -- with it on (the
-                          // ESP32 default), this board would silently drop off WiFi
-                          // for 1-3 minutes at a time and only recover once its
-                          // internal auto-reconnect eventually kicked in. That showed
-                          // up as the AC/Fan/lights going completely unreachable for
-                          // a couple minutes even though nothing on the network side
-                          // had changed.
-  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -343,51 +313,6 @@ void setup() {
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/targetTemperature", HTTP_GET, handleSetTargetTemp);
   server.on("/targetHeatingCoolingState", HTTP_GET, handleSetTargetState);
-
-  // Raw helper endpoints for proxy calibration & swap control (does NOT trigger unwanted IR)
-  server.on("/set_state_memory", HTTP_GET, []() {
-    if (server.hasArg("temp")) {
-      targetTemperature = round(server.arg("temp").toFloat());
-      currentTemperature = targetTemperature;
-    }
-    if (server.hasArg("state")) {
-      targetHeatingCoolingState = server.arg("state").toInt();
-    }
-    server.send(200, "text/plain", "OK");
-  });
-
-  server.on("/send_raw_power", HTTP_GET, []() {
-    sendAcPower(AC_CODE_POWER);
-    server.send(200, "text/plain", "OK");
-  });
-
-  server.on("/raw_temp_steps", HTTP_GET, []() {
-    if (server.hasArg("target")) {
-      float roundedVal = round(server.arg("target").toFloat());
-      if (roundedVal >= 16.0 && roundedVal <= 34.0) {
-        int steps = (int)(roundedVal - targetTemperature);
-        if (steps > 0) {
-          for (int i = 0; i < steps; i++) { sendAcIR(AC_CODE_TEMP_UP); delay(250); }
-        } else if (steps < 0) {
-          for (int i = 0; i < abs(steps); i++) { sendAcIR(AC_CODE_TEMP_DOWN); delay(250); }
-        }
-        targetTemperature = roundedVal;
-        currentTemperature = roundedVal;
-      }
-    }
-    server.send(200, "text/plain", "OK");
-  });
-
-  server.on("/set_state_raw", HTTP_GET, []() {
-    if (server.hasArg("state")) {
-      int newState = server.arg("state").toInt();
-      if ((newState == 0 && targetHeatingCoolingState != 0) || (newState != 0 && targetHeatingCoolingState == 0)) {
-        sendAcPower(AC_CODE_POWER);
-      }
-      targetHeatingCoolingState = newState;
-    }
-    server.send(200, "text/plain", "OK");
-  });
 
   // --- VIRTUAL STATEFUL ROUTING FOR SWING, MODE, FAN, ECO ---
   server.on("/ac/swing", HTTP_GET, []() {
@@ -708,6 +633,19 @@ void setup() {
     server.send(200, "text/plain", lampSunsetState ? "1" : "0");
   });
 
+  // Fan (Relay on GPIO 33)
+  server.on("/lamp/fan/on", HTTP_GET, []() {
+    setLamp(relaySunset, lampSunsetState, true);
+    server.send(200, "text/plain", "1");
+  });
+  server.on("/lamp/fan/off", HTTP_GET, []() {
+    setLamp(relaySunset, lampSunsetState, false);
+    server.send(200, "text/plain", "0");
+  });
+  server.on("/lamp/fan/status", HTTP_GET, []() {
+    server.send(200, "text/plain", lampSunsetState ? "1" : "0");
+  });
+
   // Backlight
   server.on("/lamp/backlight/on", HTTP_GET, []() {
     setLamp(relayBack, lampBackState, true);
@@ -728,28 +666,9 @@ void setup() {
   server.begin();
 }
 
-unsigned long last_wifi_check_time = 0;
-const unsigned long WIFI_CHECK_INTERVAL_MS = 5000UL;
-
 void loop() {
   server.handleClient();
   ArduinoOTA.handle();
-
-  // --- WiFi Reconnect Watchdog ---
-  // setup() only calls WiFi.begin() once at boot; if the connection ever drops for
-  // any reason after that (router hiccup, brief interference, etc.), nothing used to
-  // notice or retry, leaving this device relying solely on the ESP32 core's own
-  // internal auto-reconnect timing to come back -- which is what produced multi-
-  // minute outages. Checked every 5s (cheap, no blocking delay()) so a real drop is
-  // caught and retried within seconds instead.
-  if (millis() - last_wifi_check_time >= WIFI_CHECK_INTERVAL_MS) {
-    last_wifi_check_time = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected -- reconnecting...");
-      WiFi.disconnect();
-      WiFi.begin(ssid, password);
-    }
-  }
 
   // --- AC Background Timer ---
   if (timer_active && (millis() - timer_start_time >= timer_duration_ms)) {
@@ -757,7 +676,7 @@ void loop() {
 
     // Automatically power off the AC if it is currently tracked as ON
     if (targetHeatingCoolingState != 0) {
-      sendAcPower(AC_CODE_POWER);
+      sendAcIR(AC_CODE_POWER);
       targetHeatingCoolingState = 0;
       Serial.println("Timer Expired: Sent IR AC Power Off command");
     }
