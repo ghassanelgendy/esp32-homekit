@@ -768,6 +768,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, str(e))
 
+        # Homebridge HTTP-FAN-V2 active status / validation endpoint. Always respond 1
+        # directly from proxy without touching ESP32 or acquiring hardware locks.
+        elif path == "/ac/fan/active":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"1")
+
         else:
             try:
                 # Only cache/dedupe true status reads. Everything else falling through
