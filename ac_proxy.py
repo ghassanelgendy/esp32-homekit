@@ -43,14 +43,17 @@ AC_PHASE_RATIO = 1.0 / 6.0
 swap_thread = None
 swap_stop_event = threading.Event()
 
+swap_state_lock = threading.Lock()
+
 def save_swap_state(active, interval_minutes):
-    try:
-        tmp_path = SWAP_STATE_FILE + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump({"active": bool(active), "interval_minutes": float(interval_minutes)}, f)
-        os.replace(tmp_path, SWAP_STATE_FILE)
-    except Exception as e:
-        print(f"[AC Proxy] Error saving swap state: {e}")
+    with swap_state_lock:
+        try:
+            tmp_path = f"{SWAP_STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp_path, "w") as f:
+                json.dump({"active": bool(active), "interval_minutes": float(interval_minutes)}, f)
+            os.replace(tmp_path, SWAP_STATE_FILE)
+        except Exception as e:
+            print(f"[AC Proxy] Error saving swap state: {e}")
 
 def load_swap_state():
     global swap_interval_minutes
@@ -128,7 +131,8 @@ def fetch_esp32(path, timeout=2.0):
 
         url = f"http://{ESP32_IP}{path}"
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
+            req = urllib.request.Request(url, headers={"Connection": "close"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 data = r.read()
             t = time.time()
             _esp32_cache[path] = (t, data)
@@ -161,18 +165,19 @@ def fetch_esp32(path, timeout=2.0):
     finally:
         esp32_io_lock.release()
 
-def send_esp32_cmd(path, timeout=2.5, retries=2):
-    """ Send an action command to the ESP32 synchronized with esp32_io_lock, with retries. """
+def send_esp32_cmd(path, timeout=5.0, retries=3):
+    """ Send an action command to the ESP32 synchronized with esp32_io_lock, with retries and Connection: close. """
     global ESP32_IP
     last_err = None
     for attempt in range(retries + 1):
         try:
             url = f"http://{ESP32_IP}{path}"
             # Acquire lock with a generous wait so action commands always get through
-            if not esp32_io_lock.acquire(timeout=8.0):
+            if not esp32_io_lock.acquire(timeout=10.0):
                 raise TimeoutError("ESP32 lock busy")
             try:
-                with urllib.request.urlopen(url, timeout=timeout) as r:
+                req = urllib.request.Request(url, headers={"Connection": "close"})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
                     data = r.read()
                     # Optimistically update status cache immediately
                     now = time.time()
@@ -193,14 +198,15 @@ def send_esp32_cmd(path, timeout=2.5, retries=2):
         except Exception as e:
             last_err = e
             if attempt < retries:
-                time.sleep(0.15)
+                # Exponential backoff between retries to let ESP32 TCP stack clear
+                time.sleep(0.35 * (attempt + 1))
     raise last_err
 
-def set_ac_raw_state(state, retries=2):
+def set_ac_raw_state(state, retries=3):
     """ Turn AC state ON (2) or OFF (0) using targetHeatingCoolingState route on ESP32 with retries """
     global virtual_state_override
     try:
-        result = send_esp32_cmd(f"/targetHeatingCoolingState?value={state}", timeout=2.5, retries=retries)
+        result = send_esp32_cmd(f"/targetHeatingCoolingState?value={state}", timeout=5.0, retries=retries)
         _esp32_cache.pop("/status", None)
         virtual_state_override = int(state)
         return result
@@ -212,11 +218,11 @@ def set_ac_memory_only(state):
     """ Sync state tracking memory """
     pass
 
-def set_fan_raw_state(state, retries=2):
+def set_fan_raw_state(state, retries=3):
     """ Turn Fan ON (1) or OFF (0) using the ESP32's fan relay endpoint with retries """
     endpoint = "on" if state == 1 else "off"
     try:
-        result = send_esp32_cmd(f"/lamp/fan/{endpoint}", timeout=2.5, retries=retries)
+        result = send_esp32_cmd(f"/lamp/fan/{endpoint}", timeout=5.0, retries=retries)
         _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if state == 1 else b"0")
         _esp32_cache.pop("/lamps/status", None)
         return result
@@ -690,7 +696,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 print("[AC Proxy] Fan manually turned OFF while swap active -> stopping swap.")
                 stop_ac_fan_swap()
             try:
-                data = send_esp32_cmd(path, timeout=2.5, retries=2)
+                data = send_esp32_cmd(path, timeout=5.0, retries=3)
                 # Optimistically update fan status cache
                 _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if path == "/lamp/fan/on" else b"0")
                 _esp32_cache.pop("/lamps/status", None)
@@ -785,7 +791,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if base_clean.endswith("/status") or base_clean == "/lamps/status":
                     data = fetch_esp32(self.path)
                 else:
-                    data = send_esp32_cmd(self.path, timeout=2.5, retries=2)
+                    data = send_esp32_cmd(self.path, timeout=5.0, retries=3)
                     # Optimistically update cache and invalidate stale keys
                     base = self.path.split("?", 1)[0]
                     _esp32_cache.pop(base, None)
@@ -944,7 +950,8 @@ def esp32_background_poller():
             if esp32_io_lock.acquire(blocking=False):
                 try:
                     url = f"http://{ESP32_IP}/lamps/status"
-                    with urllib.request.urlopen(url, timeout=2.0) as r:
+                    req = urllib.request.Request(url, headers={"Connection": "close"})
+                    with urllib.request.urlopen(req, timeout=2.5) as r:
                         raw = r.read()
                     data = json.loads(raw.decode("utf-8"))
                     t = time.time()
@@ -969,7 +976,8 @@ def esp32_background_poller():
             if not is_calibrating and esp32_io_lock.acquire(blocking=False):
                 try:
                     url = f"http://{ESP32_IP}/status"
-                    with urllib.request.urlopen(url, timeout=2.0) as r:
+                    req = urllib.request.Request(url, headers={"Connection": "close"})
+                    with urllib.request.urlopen(req, timeout=2.5) as r:
                         raw = r.read()
                     _esp32_cache["/status"] = (time.time(), raw)
                     consecutive_failures = 0
@@ -984,7 +992,8 @@ def esp32_background_poller():
             if not is_calibrating and esp32_io_lock.acquire(blocking=False):
                 try:
                     url = f"http://{ESP32_IP}/led/status"
-                    with urllib.request.urlopen(url, timeout=2.0) as r:
+                    req = urllib.request.Request(url, headers={"Connection": "close"})
+                    with urllib.request.urlopen(req, timeout=2.5) as r:
                         raw = r.read()
                     _esp32_cache["/led/status"] = (time.time(), raw)
                     consecutive_failures = 0
@@ -1004,12 +1013,29 @@ def esp32_background_poller():
 def main():
     print(f"Starting AC Proxy Server on port {PORT}...")
     threading.Thread(target=esp32_background_poller, daemon=True).start()
-    time.sleep(2.0)  # Allow poller to warm cache before auto-resuming swap
 
-    # Auto-resume swap loop if it was active before restart
-    if load_swap_state():
-        print(f"[AC Proxy] Restoring previously active AC / Fan swap loop ({swap_interval_minutes}m)...")
-        start_ac_fan_swap(swap_interval_minutes)
+    # Auto-resume swap loop in background once ESP32 is confirmed reachable
+    def auto_resume_swap():
+        if load_swap_state():
+            print(f"[AC Proxy] Waiting for ESP32 ({ESP32_IP}) before restoring swap loop...")
+            start_wait = time.time()
+            connected = False
+            while time.time() - start_wait < 60:
+                try:
+                    with urllib.request.urlopen(f"http://{ESP32_IP}/status", timeout=2.0) as r:
+                        if r.status == 200:
+                            connected = True
+                            break
+                except Exception:
+                    time.sleep(2.0)
+            if connected:
+                time.sleep(2.0)  # Allow poller to warm cache
+                print(f"[AC Proxy] Restoring previously active AC / Fan swap loop ({swap_interval_minutes}m)...")
+                start_ac_fan_swap(swap_interval_minutes)
+            else:
+                print("[AC Proxy] Warning: ESP32 not reachable after 60s at startup; swap auto-resume deferred.")
+
+    threading.Thread(target=auto_resume_swap, daemon=True).start()
 
     server = ThreadingHTTPServer(("", PORT), ProxyHandler)  # bind all interfaces
     server.serve_forever()

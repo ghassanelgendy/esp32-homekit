@@ -301,6 +301,9 @@ void setup() {
   irsendAC.begin();
   irsendLED.begin();
 
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // Disable WiFi modem-sleep so incoming packets are never delayed/dropped
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -653,9 +656,22 @@ void setup() {
   server.begin();
 }
 
+unsigned long last_wifi_check_time = 0;
+const unsigned long WIFI_CHECK_INTERVAL_MS = 5000UL;
+
 void loop() {
   server.handleClient();
   ArduinoOTA.handle();
+
+  // --- WiFi Reconnect Watchdog ---
+  if (millis() - last_wifi_check_time >= WIFI_CHECK_INTERVAL_MS) {
+    last_wifi_check_time = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected -- reconnecting...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+    }
+  }
 
   // --- AC Background Timer ---
   if (timer_active && (millis() - timer_start_time >= timer_duration_ms)) {
