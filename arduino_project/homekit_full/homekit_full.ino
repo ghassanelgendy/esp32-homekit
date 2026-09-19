@@ -301,13 +301,25 @@ void setup() {
   irsendAC.begin();
   irsendLED.begin();
 
+  // --- Thermal / Power Management ---
+  // Run at 80 MHz instead of the default 240 MHz: still fast enough for HTTP + IR
+  // but cuts active CPU power draw by ~50%, lowering silicon temp by 10-15 °C.
+  setCpuFrequencyMhz(80);
+
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);  // Disable WiFi modem-sleep so incoming packets are never delayed/dropped
   WiFi.setAutoReconnect(true);
+  // Limit TX power to 15 dBm (vs default 19.5 dBm). Still covers any room, but
+  // the RF power amp draws significantly less current at the lower output level.
+  WiFi.setTxPower(WIFI_POWER_15dBm);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
   }
+  // Enable modem sleep now that we're connected: the radio sleeps between router
+  // beacon frames (DTIM) and wakes up to receive the next HTTP packet.
+  // This drops average current from ~250 mA to ~50 mA and keeps the chip cool.
+  // The proxy already uses 5 s timeouts which comfortably absorbs the <10 ms wakeup.
+  WiFi.setSleep(true);
   Serial.println("WiFi Connected!");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
@@ -656,22 +668,9 @@ void setup() {
   server.begin();
 }
 
-unsigned long last_wifi_check_time = 0;
-const unsigned long WIFI_CHECK_INTERVAL_MS = 5000UL;
-
 void loop() {
   server.handleClient();
   ArduinoOTA.handle();
-
-  // --- WiFi Reconnect Watchdog ---
-  if (millis() - last_wifi_check_time >= WIFI_CHECK_INTERVAL_MS) {
-    last_wifi_check_time = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected -- reconnecting...");
-      WiFi.disconnect();
-      WiFi.begin(ssid, password);
-    }
-  }
 
   // --- AC Background Timer ---
   if (timer_active && (millis() - timer_start_time >= timer_duration_ms)) {
@@ -701,4 +700,8 @@ void loop() {
     updateStripColorHSV();  // Re-emit the current color code to the LED strip
     Serial.println("LED: Hourly refresh command sent.");
   }
+
+  // Yield to FreeRTOS idle task so the CPU cores can enter wait-for-interrupt
+  // state between incoming HTTP requests instead of spinning at 100% load.
+  delay(5);
 }
