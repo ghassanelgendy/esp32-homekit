@@ -315,11 +315,6 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
   }
-  // Enable modem sleep now that we're connected: the radio sleeps between router
-  // beacon frames (DTIM) and wakes up to receive the next HTTP packet.
-  // This drops average current from ~250 mA to ~50 mA and keeps the chip cool.
-  // The proxy already uses 5 s timeouts which comfortably absorbs the <10 ms wakeup.
-  WiFi.setSleep(true);
   Serial.println("WiFi Connected!");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
