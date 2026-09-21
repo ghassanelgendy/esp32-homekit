@@ -12,6 +12,19 @@ DEFAULT_ESP32_IP = os.environ.get("ESP32_IP", "")
 ESP32_IP = DEFAULT_ESP32_IP
 PORT = 8880
 DATA_DIR = "/data" if os.path.isdir("/data") else "/tmp"
+LOGS_DIR = "/logs" if os.path.isdir("/logs") else os.path.join(os.path.dirname(__file__), "logs")
+UNREACHABLE_LOG_FILE = os.path.join(LOGS_DIR, "esp32_failures.log")
+
+def log_esp32_failure(reason, path, target_ip, details=""):
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        line = f"[{timestamp}] [FAILURE] IP: {target_ip} | Path: {path} | Reason: {reason} | Details: {details}\n"
+        with open(UNREACHABLE_LOG_FILE, "a") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"[AC Proxy] Error writing to failure log: {e}")
+
 STATE_FILE = os.path.join(DATA_DIR, "ac_last_temp.txt")
 FAN_LEVEL_STATE_FILE = os.path.join(DATA_DIR, "ac_last_fan_level.txt")
 SWAP_STATE_FILE = os.path.join(DATA_DIR, "ac_swap_state.json")
@@ -148,6 +161,7 @@ def fetch_esp32(path, timeout=2.0):
 
             return data
         except Exception as e:
+            log_esp32_failure("FETCH_FAILED", path, ESP32_IP, str(e))
             if cached:
                 return cached[1]
             if path == "/lamps/status":
@@ -165,15 +179,16 @@ def fetch_esp32(path, timeout=2.0):
     finally:
         esp32_io_lock.release()
 
-def send_esp32_cmd(path, timeout=5.0, retries=3):
+def send_esp32_cmd(path, timeout=2.0, retries=1):
     """ Send an action command to the ESP32 synchronized with esp32_io_lock, with retries and Connection: close. """
     global ESP32_IP
     last_err = None
     for attempt in range(retries + 1):
         try:
             url = f"http://{ESP32_IP}{path}"
-            # Acquire lock with a generous wait so action commands always get through
-            if not esp32_io_lock.acquire(timeout=10.0):
+            # Acquire lock with a brief wait so action commands don't queue up indefinitely
+            if not esp32_io_lock.acquire(timeout=4.0):
+                log_esp32_failure("LOCK_BUSY", path, ESP32_IP, f"attempt {attempt+1}/{retries+1}")
                 raise TimeoutError("ESP32 lock busy")
             try:
                 req = urllib.request.Request(url, headers={"Connection": "close"})
@@ -197,16 +212,19 @@ def send_esp32_cmd(path, timeout=5.0, retries=3):
                 esp32_io_lock.release()
         except Exception as e:
             last_err = e
+            log_esp32_failure(f"CMD_ATTEMPT_{attempt+1}_FAILED", path, ESP32_IP, str(e))
             if attempt < retries:
-                # Exponential backoff between retries to let ESP32 TCP stack clear
-                time.sleep(0.35 * (attempt + 1))
+                # Brief backoff between retries to let ESP32 TCP stack clear
+                time.sleep(0.2)
+    log_esp32_failure("CMD_ALL_RETRIES_EXHAUSTED", path, ESP32_IP, str(last_err))
     raise last_err
 
-def set_ac_raw_state(state, retries=3):
+def set_ac_raw_state(state, retries=1, force=True):
     """ Turn AC state ON (2) or OFF (0) using targetHeatingCoolingState route on ESP32 with retries """
     global virtual_state_override
     try:
-        result = send_esp32_cmd(f"/targetHeatingCoolingState?value={state}", timeout=5.0, retries=retries)
+        force_arg = "&force=1" if force else ""
+        result = send_esp32_cmd(f"/targetHeatingCoolingState?value={state}{force_arg}", timeout=2.0, retries=retries)
         _esp32_cache.pop("/status", None)
         virtual_state_override = int(state)
         return result
@@ -218,11 +236,11 @@ def set_ac_memory_only(state):
     """ Sync state tracking memory """
     pass
 
-def set_fan_raw_state(state, retries=3):
+def set_fan_raw_state(state, retries=1):
     """ Turn Fan ON (1) or OFF (0) using the ESP32's fan relay endpoint with retries """
     endpoint = "on" if state == 1 else "off"
     try:
-        result = send_esp32_cmd(f"/lamp/fan/{endpoint}", timeout=5.0, retries=retries)
+        result = send_esp32_cmd(f"/lamp/fan/{endpoint}", timeout=2.0, retries=retries)
         _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if state == 1 else b"0")
         _esp32_cache.pop("/lamps/status", None)
         return result
@@ -314,9 +332,10 @@ def ac_fan_swap_loop(minutes):
             # If AC is currently running (whether from initial phase or user manually turned it on), turn AC OFF and Fan ON
             if live_ac_on or current_phase == "ac":
                 print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning AC OFF, Fan ON (Phase: AC -> Fan)...")
+                # HARD SAFETY GUARD: Never turn Fan on if AC power off command fails!
                 ac_res = set_ac_raw_state(0, retries=4)
                 if ac_res is None:
-                    print("[AC Proxy] WARNING: Failed to turn AC OFF during swap! Retrying in 10s without advancing to Fan phase...")
+                    print("[AC Proxy] WARNING: Failed to turn AC OFF during swap! ABORTING Fan activation to prevent both running. Retrying in 10s...")
                     last_phase_time = time.time() - (target_seconds - 10.0)
                     continue
                 time.sleep(1.0)
@@ -328,6 +347,7 @@ def ac_fan_swap_loop(minutes):
                 current_phase = "fan"
             else:
                 print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning Fan OFF, AC ON (Phase: Fan -> AC)...")
+                # HARD SAFETY GUARD: Never turn AC on if Fan power off command fails!
                 fan_res = set_fan_raw_state(0, retries=4)
                 if fan_res is None:
                     print("[AC Proxy] WARNING: Failed to turn Fan OFF during swap! ABORTING AC activation to prevent both running. Retrying in 10s...")
@@ -524,6 +544,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(res_json).encode("utf-8"))
             return
 
+        # Explicit sync endpoint to match system state with real life without firing IR
+        if path == "/sync_ac":
+            temp_param = query.get("temp", [None])[0]
+            st_param = query.get("state", [None])[0]
+            if temp_param is not None:
+                t_val = int(float(temp_param))
+                save_last_temp(t_val)
+            if st_param is not None:
+                virtual_state_override = int(st_param)
+            # Invalidate cached status
+            _esp32_cache.pop("/status", None)
+            res_json = {
+                "targetTemperature": float(active_target_temp),
+                "currentTemperature": float(active_target_temp),
+                "targetHeatingCoolingState": virtual_state_override if virtual_state_override is not None else 0,
+                "currentHeatingCoolingState": virtual_state_override if virtual_state_override is not None else 0
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(res_json).encode("utf-8"))
+            return
+
         # 1. Status: Sync in Real-Time
         if path == "/status":
             try:
@@ -696,7 +739,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 print("[AC Proxy] Fan manually turned OFF while swap active -> stopping swap.")
                 stop_ac_fan_swap()
             try:
-                data = send_esp32_cmd(path, timeout=5.0, retries=3)
+                data = send_esp32_cmd(path, timeout=2.0, retries=1)
                 # Optimistically update fan status cache
                 _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if path == "/lamp/fan/on" else b"0")
                 _esp32_cache.pop("/lamps/status", None)
@@ -719,7 +762,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"OK")
             else:
                 try:
-                    data = send_esp32_cmd(f"/targetTemperature?value={val}", timeout=2.5, retries=2)
+                    data = send_esp32_cmd(f"/targetTemperature?value={val}", timeout=2.0, retries=1)
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain")
                     self.end_headers()
@@ -750,7 +793,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     target_level = 3
                 save_fan_level(target_level)
                 try:
-                    send_esp32_cmd(f"/ac/fan/speed?value={val}", timeout=2.5, retries=2)
+                    send_esp32_cmd(f"/ac/fan/speed?value={val}", timeout=2.0, retries=1)
                 except Exception as e:
                     print(f"[AC Proxy] Error forwarding fan speed set: {e}")
             self.send_response(200)
@@ -762,7 +805,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # its resulting level back into our cache so /ac/fan/speed/status stays in sync.
         elif path == "/ac/fan":
             try:
-                data = send_esp32_cmd("/ac/fan", timeout=2.5, retries=2)
+                data = send_esp32_cmd("/ac/fan", timeout=2.0, retries=1)
                 try:
                     save_fan_level(int(data.decode().strip()))
                 except Exception:
@@ -791,7 +834,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if base_clean.endswith("/status") or base_clean == "/lamps/status":
                     data = fetch_esp32(self.path)
                 else:
-                    data = send_esp32_cmd(self.path, timeout=5.0, retries=3)
+                    data = send_esp32_cmd(self.path, timeout=2.0, retries=1)
                     # Optimistically update cache and invalidate stale keys
                     base = self.path.split("?", 1)[0]
                     _esp32_cache.pop(base, None)
@@ -841,100 +884,51 @@ def run_state_transition(val, target_temp, force=False):
     global is_calibrating, ESP32_IP, virtual_state_override
     with lock:
         try:
-            if val != "0":
-                t_val = int(float(target_temp))
-                if t_val < 16 or t_val > 30:
-                    t_val = 24
+            t_val = int(float(target_temp))
+            if t_val < 16 or t_val > 30:
+                t_val = 24
 
-                # Skip a redundant "turn ON" if the AC is already confirmed ON at this
-                # exact target
+            if val != "0":
+                # If AC is already on and target temperature is the same, do nothing
                 if not force and get_current_ac_state() and t_val == active_target_temp:
                     print(f"[AC Proxy] Redundant ON command at {t_val}°C ignored (AC already ON at that target).")
                     return
 
-                is_calibrating = True
+                print(f"[AC Proxy] Powering ON AC -> Setting target {t_val}°C...")
                 virtual_state_override = int(val)
-
-                print(f"[AC Proxy] Powering ON -> Resuming & calibrating to last degree: {t_val}°C...")
-
-                # Step 1: Set ESP32 memory to 16.0
-                try:
-                    send_esp32_cmd(f"/set_state_memory?temp=16&state={val}", timeout=10)
-                except Exception:
-                    send_esp32_cmd(f"/targetTemperature?value=16", timeout=10)
-                time.sleep(0.5)
-
-                # Step 2: Turn on the AC
-                try:
-                    send_esp32_cmd("/send_raw_power", timeout=10)
-                except Exception:
-                    send_esp32_cmd(f"/targetHeatingCoolingState?value={val}", timeout=10)
-                time.sleep(1.5)
-
-                # Step 3: Go up to 31
-                try:
-                    send_esp32_cmd("/raw_temp_steps?target=31", timeout=15)
-                except Exception:
-                    send_esp32_cmd("/targetTemperature?value=31", timeout=15)
-                time.sleep(1.0)
-
-                # Step 4: Go down to 16
-                try:
-                    send_esp32_cmd("/raw_temp_steps?target=16", timeout=15)
-                except Exception:
-                    send_esp32_cmd("/targetTemperature?value=16", timeout=15)
-                time.sleep(1.0)
-
-                # Step 5: Step UP to last used degree
-                try:
-                    send_esp32_cmd(f"/raw_temp_steps?target={t_val}", timeout=15)
-                except Exception:
-                    send_esp32_cmd(f"/targetTemperature?value={int(t_val)}", timeout=15)
-                print(f"[AC Proxy] Power-on calibration complete! Resumed perfectly at {t_val}°C.")
+                # Send power toggle to ESP32
+                set_ac_raw_state(val, retries=1)
+                time.sleep(0.3)
+                # Send target temperature directly without sweeping to 31 or 16
+                send_esp32_cmd(f"/targetTemperature?value={t_val}", timeout=2.0, retries=1)
+                save_last_temp(t_val)
+                print(f"[AC Proxy] Power-on sequence complete at {t_val}°C.")
             else:
-                print("[AC Proxy] Turning off AC...")
+                print("[AC Proxy] Turning OFF AC...")
                 virtual_state_override = 0
-                send_esp32_cmd("/targetHeatingCoolingState?value=0", timeout=10)
+                set_ac_raw_state(0, retries=1)
         except Exception as e:
             print(f"[AC Proxy] Error in state transition: {e}")
         finally:
             is_calibrating = False
-            # Release the override once this normal (non-swap) transition is done so
-            # /status goes back to trusting the ESP32's live, authoritative state.
             if not swap_active:
                 virtual_state_override = None
 
 def run_hard_calibration(target_temp):
+    """ SAFE calibration: Syncs state in software and sends clean target temp without dangerous floor/ceiling swings """
     global is_calibrating, ESP32_IP
     with lock:
         try:
-            is_calibrating = True
             t_val = int(float(target_temp))
             if t_val < 16 or t_val > 30:
                 t_val = 24
-            print(f"[AC Proxy] Manual Full Hard Calibration -> Floor & Ceiling (Target: {t_val}°C)...")
-            # 1. Drive to 31 (Ceiling)
-            try:
-                send_esp32_cmd("/raw_temp_steps?target=31", timeout=15)
-            except Exception:
-                send_esp32_cmd("/targetTemperature?value=31", timeout=15)
-            time.sleep(1.0)
-            
-            # 2. Drive to 16 (Floor)
-            try:
-                send_esp32_cmd("/raw_temp_steps?target=16", timeout=15)
-            except Exception:
-                send_esp32_cmd("/targetTemperature?value=16", timeout=15)
-            time.sleep(1.0)
-            
-            # 3. Step up to target
-            try:
-                send_esp32_cmd(f"/raw_temp_steps?target={t_val}", timeout=15)
-            except Exception:
-                send_esp32_cmd(f"/targetTemperature?value={int(t_val)}", timeout=15)
-            print(f"[AC Proxy] Calibration Complete! Synchronized at {t_val}°C.")
+            print(f"[AC Proxy] Safe Sync -> Setting AC to {t_val}°C without floor/ceiling sweeping...")
+            save_last_temp(t_val)
+            # Sync directly to target
+            send_esp32_cmd(f"/targetTemperature?value={t_val}", timeout=2.0, retries=1)
+            print(f"[AC Proxy] Safe Sync Complete at {t_val}°C.")
         except Exception as e:
-            print(f"[AC Proxy] Error during hard calibration: {e}")
+            print(f"[AC Proxy] Error during safe sync: {e}")
         finally:
             is_calibrating = False
 
