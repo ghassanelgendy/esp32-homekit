@@ -44,9 +44,8 @@ Below is the connection schematic for the ESP32, dual IR transmitters, and the 4
 | **Relay 4 Control** | `GPIO 32` | Outputs 3.3V signals to Level Converter (shifts to 5V IN4 on Relay Board) |
 
 ### Firmware
-Use the latest complete sketch:
-*   **`homekit_full.ino`**: The latest, feature-complete Arduino sketch implementing dual IR transmitters (AC & LED) and 4-channel relay controls for room lighting.
-*   `esp32_ac_controller.ino`: Legacy/minimal version focusing primarily on IR control.
+The entire ESP32 system runs on a single unified sketch:
+*   **`homekit_full.ino`**: High-performance FreeRTOS multi-threaded firmware with AsyncWebServer, dual IR transmitters (AC & LED), 4-channel relay controls, and watchdog recovery AP.
 
 ### Audio Clap Detector
 
