@@ -4,9 +4,8 @@
 #include <IRsend.h>
 #include <ArduinoOTA.h>
 
-#include "secrets.h"
-const char* ssid = SECRET_SSID;
-const char* password = SECRET_PASSWORD;
+const char* ssid = "Chromium";
+const char* password = "017265P!!";
 
 // --- Dual IR Setup ---
 const uint16_t kIrAcPin = 27;  // AC IR transmitter on GPIO 27
@@ -310,8 +309,8 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.setTxPower(WIFI_POWER_15dBm);
 
-  // Static IP configuration - locked to 192.168.1.140 so proxy never loses it
-  IPAddress local_IP(192, 168, 1, 140);
+  // Static IP configuration - locked to 192.168.1.7 matching router reservation
+  IPAddress local_IP(192, 168, 1, 7);
   IPAddress gateway(192, 168, 1, 1);
   IPAddress subnet(255, 255, 255, 0);
   IPAddress primaryDNS(192, 168, 1, 1);

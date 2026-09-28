@@ -8,7 +8,7 @@ import threading
 import concurrent.futures
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-DEFAULT_ESP32_IP = os.environ.get("ESP32_IP", "192.168.1.140")
+DEFAULT_ESP32_IP = os.environ.get("ESP32_IP", "192.168.1.7")
 ESP32_IP = DEFAULT_ESP32_IP
 PORT = 8880
 DATA_DIR = "/data" if os.path.isdir("/data") else "/tmp"
