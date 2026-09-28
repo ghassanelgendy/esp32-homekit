@@ -2,7 +2,7 @@
 import urllib.request
 import time
 
-TARGET_URL = "http://192.168.1.7/status"
+TARGET_URL = "http://192.168.1.112/status"
 INTERVAL = 2.0  # Poll every 2 seconds to keep the HTTP TCP/IP stack hot
 
 def main():
