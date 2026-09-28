@@ -305,8 +305,16 @@ void setup() {
   // but cuts active CPU power draw by ~50%, lowering silicon temp by 10-15 °C.
   setCpuFrequencyMhz(80);
 
+  // Reset Wi-Fi stack & clear stale NVS connection cache
+  WiFi.persistent(false);
+  WiFi.disconnect(true, true);
+  delay(200);
+
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+
+  Serial.print("ESP32 MAC: ");
+  Serial.println(WiFi.macAddress());
 
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
@@ -687,22 +695,16 @@ void loop() {
   static unsigned long wifiDisconnectedSince = 0;
   unsigned long currentMillis = millis();
 
-  if (currentMillis - lastWifiCheck >= 10000) {
+  if (currentMillis - lastWifiCheck >= 5000) {
     lastWifiCheck = currentMillis;
     if (WiFi.status() != WL_CONNECTED) {
       if (wifiDisconnectedSince == 0) {
         wifiDisconnectedSince = currentMillis;
         Serial.println("Wi-Fi connection lost.");
       }
-      // Re-trigger connection only if disconnected for more than 10s
-      if (currentMillis - wifiDisconnectedSince >= 10000UL) {
-        Serial.println("Triggering WiFi.begin()...");
-        WiFi.disconnect();
-        WiFi.begin(ssid, password);
-      }
-      // Hardware watchdog: If disconnected for more than 60 seconds, hard restart the ESP32!
-      if (currentMillis - wifiDisconnectedSince > 60000UL) {
-        Serial.println("Wi-Fi lost for >60s. Hardware restart triggered!");
+      // Hardware watchdog: If disconnected for more than 45 seconds, hard restart the ESP32!
+      if (currentMillis - wifiDisconnectedSince > 45000UL) {
+        Serial.println("Wi-Fi lost for >45s. Hardware restart triggered!");
         ESP.restart();
       }
     } else {
