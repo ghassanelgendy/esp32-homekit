@@ -266,9 +266,28 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n--- ESP32 BOOTING ---");
+  // Initialize Wi-Fi hardware properly before reading MAC
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  delay(200);
+
   Serial.print("ESP32 MAC: ");
   Serial.println(WiFi.macAddress());
 
+  Serial.printf("Connecting to Wi-Fi SSID: %s\n", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // --- Hardware Pin & IR Setup ---
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
@@ -283,18 +302,6 @@ void setup() {
 
   irsendAC.begin();
   irsendLED.begin();
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.printf("Connecting to Wi-Fi SSID: %s", ssid);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("\nWiFi Connected!");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
 
   // --- AC Routes ---
   server.on("/status", HTTP_GET, handleStatus);
