@@ -262,16 +262,34 @@ void handleLEDStatus() {
   server.send(200, "application/json", json);
 }
 
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_START:
+      Serial.println("\n[WiFi] Station Started");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("\n[WiFi] Connected to AP!");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.print("\n[WiFi] SUCCESS! Got IP: ");
+      Serial.println(WiFi.localIP());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.printf("\n[WiFi] Disconnected! Reason code: %d\n", info.wifi_sta_disconnected.reason);
+      break;
+    default:
+      break;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n--- ESP32 BOOTING ---");
-  // Initialize Wi-Fi hardware properly before reading MAC
-  WiFi.persistent(false);
-  WiFi.disconnect(true);
-  delay(200);
+
+  WiFi.onEvent(onWiFiEvent);
   WiFi.mode(WIFI_STA);
-  delay(200);
+  delay(100);
 
   Serial.print("ESP32 MAC: ");
   Serial.println(WiFi.macAddress());
