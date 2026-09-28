@@ -307,19 +307,22 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  WiFi.setTxPower(WIFI_POWER_15dBm);
 
-  // Static IP configuration - locked to 192.168.1.7 matching router reservation
-  IPAddress local_IP(192, 168, 1, 7);
-  IPAddress gateway(192, 168, 1, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  IPAddress primaryDNS(192, 168, 1, 1);
-  IPAddress secondaryDNS(8, 8, 8, 8);
-  WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+      Serial.println("\n[WiFi] Associated to AP successfully.");
+    } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.print("\n[WiFi] Got IP: ");
+      Serial.println(IPAddress(info.got_ip.ip_info.ip.addr));
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      Serial.printf("\n[WiFi] Disconnected! Reason code: %d\n", info.wifi_sta_disconnected.reason);
+    }
+  });
 
+  Serial.printf("Connecting to SSID: %s\n", ssid);
   WiFi.begin(ssid, password);
   unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
     delay(500);
     Serial.print(".");
   }
@@ -328,7 +331,7 @@ void setup() {
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("\nWiFi initial connection attempt timed out; proceeding to loop with auto-reconnect watchdog...");
+    Serial.printf("\nWiFi not connected yet (status=%d). Proceeding to loop with self-healing watchdog...\n", WiFi.status());
   }
 
   // --- AC THERMOSTAT COMPATIBLE ROUTES ---
@@ -684,17 +687,22 @@ void loop() {
   static unsigned long wifiDisconnectedSince = 0;
   unsigned long currentMillis = millis();
 
-  if (currentMillis - lastWifiCheck >= 2000) {
+  if (currentMillis - lastWifiCheck >= 10000) {
     lastWifiCheck = currentMillis;
     if (WiFi.status() != WL_CONNECTED) {
       if (wifiDisconnectedSince == 0) {
         wifiDisconnectedSince = currentMillis;
-        Serial.println("Wi-Fi connection lost. Reconnecting...");
+        Serial.println("Wi-Fi connection lost.");
       }
-      WiFi.reconnect();
-      // Hardware watchdog: If disconnected for more than 45 seconds, restart the ESP32!
-      if (currentMillis - wifiDisconnectedSince > 45000UL) {
-        Serial.println("Wi-Fi lost for >45s. Self-healing hardware restart triggered!");
+      // Re-trigger connection only if disconnected for more than 10s
+      if (currentMillis - wifiDisconnectedSince >= 10000UL) {
+        Serial.println("Triggering WiFi.begin()...");
+        WiFi.disconnect();
+        WiFi.begin(ssid, password);
+      }
+      // Hardware watchdog: If disconnected for more than 60 seconds, hard restart the ESP32!
+      if (currentMillis - wifiDisconnectedSince > 60000UL) {
+        Serial.println("Wi-Fi lost for >60s. Hardware restart triggered!");
         ESP.restart();
       }
     } else {
