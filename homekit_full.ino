@@ -1,15 +1,22 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
+#include <nvs_flash.h>
+#include <rom/rtc.h>
 
-const char* ssid = "Chromium";
-const char* password = "017265P!!";
+// --- Wi-Fi Credentials ---
+const char* ssid = "Thanos";
+const char* password = "017265TT!!";
 
 // --- Dual IR Setup ---
-const uint16_t kIrAcPin = 27;  // AC IR transmitter on GPIO 27
-const uint16_t kIrLedPin = 4;  // LED Strip IR transmitter on GPIO 4
+const uint16_t kIrAcPin = 27;   // AC IR transmitter on GPIO 27
+const uint16_t kIrLedPin = 23;  // LED Strip IR transmitter on GPIO 23 (moved from GPIO 4)
 
 IRsend irsendAC(kIrAcPin);
 IRsend irsendLED(kIrLedPin);
@@ -17,35 +24,44 @@ IRsend irsendLED(kIrLedPin);
 const int LED_PIN = 2;  // Onboard status indicator
 
 WebServer server(80);
+Preferences prefs;
 
 // --- Relay / Lamp Setup ---
-// NOTE: relay3 was moved from GPIO 27 -> GPIO 33 because GPIO 27 is used
-// by kIrAcPin (the AC IR transmitter) in this sketch.
-const int relayMain    = 25;  // Lamp 1 - Main
-const int relayFairy   = 26;  // Lamp 2 - Fairy Light
-const int relayFan     = 33;  // Relay 3 - Fan
-const int relayBack    = 32;  // Lamp 4 - Backlight
+// Relays are active-LOW (LOW = ON, HIGH = OFF).
+// relay 1 = GPIO 25 (main lamp)
+// relay 2 = GPIO 26 (fairy light)
+// relay 3 = GPIO 33 (fan)
+// relay 4 = GPIO 32 (backlight)
+struct Lamp {
+  const char* name;
+  uint8_t pin;
+  bool on;
+};
 
-bool lampMainState   = false;
-bool lampFairyState  = false;
-bool lampFanState    = false;
-bool lampBackState   = false;
+Lamp lamps[] = {
+  {"main", 25, false},       // Lamp 1 - Main
+  {"fairy", 26, false},      // Lamp 2 - Fairy Light
+  {"fan", 33, false},        // Lamp 3 - Fan
+  {"backlight", 32, false},  // Lamp 4 - Backlight
+};
+const size_t LAMP_COUNT = sizeof(lamps) / sizeof(lamps[0]);
 
 // --- AC state tracking variables ---
-float targetTemperature = 25.0;  // Tracked as float but rounded to whole number
-float currentTemperature = 25.0;
+const float AC_MIN_TEMP = 16.0;
+const float AC_MAX_TEMP = 34.0;
+float targetTemperature = 25.0;     // Always a whole number
 int targetHeatingCoolingState = 0;  // HomeKit: 0=OFF, 1=HEAT, 2=COOL, 3=AUTO
 
-unsigned long last_ac_temp_time = 0;              // Tracks the last time a temp command was sent
-const unsigned long AC_WAKEUP_TIMEOUT = 20000UL;  // 20 seconds in milliseconds
+unsigned long last_ac_temp_time = 0;              // Last time a temp press was transmitted
+const unsigned long AC_WAKEUP_TIMEOUT = 20000UL;  // Display sleeps after 20s without a temp press
 
-#define AC_CODE_POWER 0x80FF48B7
-#define AC_CODE_TEMP_UP 0x80FF58A7
+#define AC_CODE_POWER     0x80FF48B7
+#define AC_CODE_TEMP_UP   0x80FF58A7
 #define AC_CODE_TEMP_DOWN 0x80FFC837
-#define AC_CODE_MODE 0x80FF40BF
-#define AC_CODE_FAN 0x80FF708F
-#define AC_CODE_SWING 0x80FFF00F
-#define AC_CODE_ECO 0x80FF50AF
+#define AC_CODE_MODE      0x80FF40BF
+#define AC_CODE_FAN       0x80FF708F
+#define AC_CODE_SWING     0x80FFF00F
+#define AC_CODE_ECO       0x80FF50AF
 
 // --- LED Strip control variables ---
 bool led_power = false;
@@ -54,268 +70,431 @@ int led_hue = 0;
 int led_saturation = 0;
 int led_speed_level = 1;  // 1 = Low (slow), 2 = Medium, 3 = High (fast)
 
-// Scanned IR code dictionary matching your strip remote buttons
-#define LED_ON 0xF7C03F
-#define LED_OFF 0xF740BF
-#define LED_BRI_UP 0xF700FF
-#define LED_BRI_DWN 0xF7807F
+// Scanned IR code dictionary matching the LED strip remote buttons
+#define LED_ON       0xF7C03F
+#define LED_OFF      0xF740BF
+#define LED_BRI_UP   0xF700FF
+#define LED_BRI_DWN  0xF7807F
 
-#define LED_RED 0xF720DF
-#define LED_GREEN 0xF7A05F
-#define LED_BLUE 0xF7609F
-#define LED_WHITE 0xF7E01F
+#define LED_RED      0xF720DF
+#define LED_GREEN    0xF7A05F
+#define LED_BLUE     0xF7609F
+#define LED_WHITE    0xF7E01F
 
-#define LED_ORANGE 0xF710EF
-#define LED_LTGREEN 0xF7906F
-#define LED_LTBLUE 0xF750AF
+#define LED_ORANGE   0xF710EF
+#define LED_LTGREEN  0xF7906F
+#define LED_LTBLUE   0xF750AF
 
 #define LED_LTORANGE 0xF730CF
-#define LED_CYAN 0xF7B04F
-#define LED_PURPLE 0xF7708F
+#define LED_CYAN     0xF7B04F
+#define LED_PURPLE   0xF7708F
 
-#define LED_YELLOR 0xF708F7
-#define LED_DKCYAN 0xF78877
-#define LED_MAGENTA 0xF748B7
+#define LED_YELLOR   0xF708F7
+#define LED_DKCYAN   0xF78877
+#define LED_MAGENTA  0xF748B7
 
-#define LED_YELLOW 0xF728D7
-#define LED_DKBLUE 0xF7A857
-#define LED_PINK 0xF76897
+#define LED_YELLOW   0xF728D7
+#define LED_DKBLUE   0xF7A857
+#define LED_PINK     0xF76897
 
 // LED Modes IR Codes
-#define LED_FLASH 0xF7D02F
-#define LED_STROBE 0xF7F00F
-#define LED_FADE 0xF7C837
-#define LED_SMOOTH 0xF7E817
+#define LED_FLASH    0xF7D02F
+#define LED_STROBE   0xF7F00F
+#define LED_FADE     0xF7C837
+#define LED_SMOOTH   0xF7E817
 
 // --- Virtual state toggles to make switches stateful ---
 bool swing_state = false;
 bool eco_state = false;
-int fan_speed_level = 1;  // 1 = Low, 2 = Medium, 3 = High
+int fan_speed_level = 3;  // 1 = Low, 2 = Medium, 3 = High (default to High matching AC)
 int ac_mode_level = 1;    // 1 = Cool, 2 = Dry, 3 = Auto
-int led_mode_level = 1;   // 1 = Default (Solid/Color control), 2 = Flash, 3 = Strobe, 4 = Fade, 5 = Smooth
-
+int led_mode_level = 1;   // 1 = Solid, 2 = Flash, 3 = Strobe, 4 = Fade, 5 = Smooth
 
 // --- Timer variables ---
 bool timer_active = false;
 unsigned long timer_duration_ms = 0;
 unsigned long timer_start_time = 0;
+const unsigned long AC_TIMER_FULL_SCALE_MS = 24UL * 60UL * 60UL * 1000UL;  // 100% = 24 hours
 
 // LED Strip Timer variables
 bool led_timer_active = false;
 unsigned long led_timer_duration_ms = 0;
 unsigned long led_timer_start_time = 0;
+const unsigned long LED_TIMER_FULL_SCALE_MS = 120UL * 60UL * 1000UL;  // 100% = 120 minutes
 
 // Tracks the last time we interacted with the LED strip
 unsigned long last_led_command_time = 0;
 const unsigned long LED_REFRESH_INTERVAL_MS = 3600000UL;  // 1 hour in milliseconds
 
+// --- WiFi watchdog variables ---
+unsigned long last_wifi_check_time = 0;
+const unsigned long WIFI_CHECK_INTERVAL_MS = 5000UL;
+const unsigned long WIFI_RECONNECT_GRACE_MS = 25000UL;
+const unsigned long WIFI_HARD_REBOOT_TIMEOUT_MS = 180000UL;  // 3 minutes
+bool wifi_down = false;
+unsigned long wifi_down_since = 0;
+unsigned long last_heartbeat_time = 0;
 
-// --- Dedicated Transmit Functions ---
-void sendAcIR(uint32_t hexCode) {
-  digitalWrite(LED_PIN, HIGH);
-  irsendAC.sendNEC(hexCode, 32);
-  delay(100);
-  digitalWrite(LED_PIN, LOW);
+// --- AC state persistence (NVS) ---
+// IR is one-way. After a brownout or watchdog restart, the AC keeps running.
+// We persist and restore AC state so HomeKit never inverts power.
+struct AcSnapshot {
+  float temp;
+  uint8_t state;
+  uint8_t fan;
+  uint8_t mode;
+  uint8_t swing;
+  uint8_t eco;
+};
+
+bool acStateDirty = false;
+unsigned long acStateDirtyTime = 0;
+const unsigned long AC_STATE_SAVE_DELAY_MS = 2000UL;  // Coalesces bursts into 1 flash write
+
+void saveAcState() {
+  AcSnapshot snap;
+  snap.temp = targetTemperature;
+  snap.state = (uint8_t)targetHeatingCoolingState;
+  snap.fan = (uint8_t)fan_speed_level;
+  snap.mode = (uint8_t)ac_mode_level;
+  snap.swing = swing_state ? 1 : 0;
+  snap.eco = eco_state ? 1 : 0;
+  prefs.putBytes("snap", &snap, sizeof(snap));
+  acStateDirty = false;
 }
 
-void sendLedIR(uint32_t hexCode) {
+void markAcStateDirty() {
+  acStateDirty = true;
+  acStateDirtyTime = millis();
+}
+
+void loadAcState() {
+  AcSnapshot snap;
+  if (prefs.getBytes("snap", &snap, sizeof(snap)) != sizeof(snap)) return;
+  if (snap.temp == snap.temp) targetTemperature = constrain(roundf(snap.temp), AC_MIN_TEMP, AC_MAX_TEMP);
+  if (snap.state <= 3) targetHeatingCoolingState = snap.state;
+  if (snap.fan >= 1 && snap.fan <= 3) fan_speed_level = snap.fan;
+  if (snap.mode >= 1 && snap.mode <= 3) ac_mode_level = snap.mode;
+  swing_state = (snap.swing != 0);
+  eco_state = (snap.eco != 0);
+}
+
+// --- Non-blocking IR transmit queue ---
+// WebServer is single-threaded. Any delay() inside an HTTP handler freezes all other
+// incoming requests, causing proxy and keepalive polls to time out.
+// Handlers enqueue pulses and return immediately (<1ms response time).
+// loop() transmits them sequentially with precise inter-frame spacing.
+const uint8_t IR_TARGET_AC  = 0;
+const uint8_t IR_TARGET_LED = 1;
+
+const uint16_t IR_GAP_SINGLE        = 100;
+const uint16_t IR_GAP_AC_STEP       = 250;
+const uint16_t IR_GAP_LED_STEP      = 150;
+const uint16_t IR_GAP_LED_POWER_ON  = 300;
+
+struct IrJob {
+  uint32_t code;
+  uint16_t gapMs;
+  uint8_t target;
+  uint8_t repeat;
+};
+
+const uint8_t IR_QUEUE_SIZE = 48;
+IrJob irQueue[IR_QUEUE_SIZE];
+uint8_t irHead = 0;
+uint8_t irCount = 0;
+uint8_t irPendingAcTempPresses = 0;
+unsigned long irLastSendTime = 0;
+uint16_t irGapMs = 0;
+
+bool isAcTempPress(uint8_t target, uint32_t code) {
+  return (target == IR_TARGET_AC) && (code == AC_CODE_TEMP_UP || code == AC_CODE_TEMP_DOWN);
+}
+
+bool irSendNext() {
+  if (irCount == 0 || millis() - irLastSendTime < irGapMs) return false;
+
+  const IrJob job = irQueue[irHead];
+  irHead = (irHead + 1) % IR_QUEUE_SIZE;
+  irCount--;
+
   digitalWrite(LED_PIN, HIGH);
-  irsendLED.sendNEC(hexCode, 32);
-  delay(100);
+  if (job.target == IR_TARGET_AC) {
+    irsendAC.sendNEC(job.code, 32, job.repeat);
+  } else {
+    irsendLED.sendNEC(job.code, 32, job.repeat);
+  }
   digitalWrite(LED_PIN, LOW);
+
+  irLastSendTime = millis();
+  irGapMs = job.gapMs;
+  if (isAcTempPress(job.target, job.code)) {
+    if (irPendingAcTempPresses > 0) irPendingAcTempPresses--;
+    last_ac_temp_time = irLastSendTime;
+  }
+  return true;
+}
+
+void irEnqueue(uint8_t target, uint32_t code, uint8_t repeat, uint16_t gapMs) {
+  while (irCount >= IR_QUEUE_SIZE) {
+    if (!irSendNext()) delay(1);
+  }
+  IrJob& slot = irQueue[(irHead + irCount) % IR_QUEUE_SIZE];
+  slot.code = code;
+  slot.gapMs = gapMs;
+  slot.target = target;
+  slot.repeat = repeat;
+  irCount++;
+  if (isAcTempPress(target, code)) irPendingAcTempPresses++;
+}
+
+void irFlush() {
+  while (irCount > 0 || millis() - irLastSendTime < irGapMs) {
+    if (!irSendNext()) delay(1);
+  }
+}
+
+void acPress(uint32_t code, uint16_t gapMs = IR_GAP_AC_STEP) {
+  irEnqueue(IR_TARGET_AC, code, 0, gapMs);
+}
+
+void ledPress(uint32_t code, uint16_t gapMs = IR_GAP_SINGLE) {
+  irEnqueue(IR_TARGET_LED, code, 0, gapMs);
+}
+
+// Sends power toggle with 1 NEC repeat frame for maximum reception reliability
+void acPowerPress() {
+  irEnqueue(IR_TARGET_AC, AC_CODE_POWER, 1, IR_GAP_SINGLE);
+}
+
+void queueAcTempSteps(int steps) {
+  uint32_t code = (steps > 0) ? AC_CODE_TEMP_UP : AC_CODE_TEMP_DOWN;
+  for (int i = abs(steps); i > 0; i--) acPress(code, IR_GAP_AC_STEP);
+}
+
+// --- Request argument parsing ---
+bool readNumberArg(const char* name, float& out) {
+  if (!server.hasArg(name)) return false;
+  String raw = server.arg(name);
+  char* end;
+  float v = strtof(raw.c_str(), &end);
+  if (end == raw.c_str() || !(v > -1e6f && v < 1e6f)) return false;
+  out = v;
+  return true;
+}
+
+bool readStateArg(const char* name, int& out) {
+  float v;
+  if (!readNumberArg(name, v)) return false;
+  int s = (int)v;
+  if (s < 0 || s > 3) return false;
+  out = s;
+  return true;
+}
+
+float clampAcTemp(float t) {
+  return constrain(roundf(t), AC_MIN_TEMP, AC_MAX_TEMP);
 }
 
 // --- Relay / Lamp helpers ---
-// Relays are wired active-LOW (LOW = ON, HIGH = OFF), matching your original sketch.
-void setLamp(int pin, bool &stateVar, bool on) {
-  digitalWrite(pin, on ? LOW : HIGH);
-  stateVar = on;
+void setLamp(size_t i, bool on) {
+  if (i >= LAMP_COUNT) return;
+  digitalWrite(lamps[i].pin, on ? LOW : HIGH);
+  lamps[i].on = on;
 }
 
-// Endpoint: GET /lamps/status -> JSON status of relays
 void handleLampsStatus() {
-  String json = "{";
-  json += "\"main\":" + String(lampMainState ? "true" : "false") + ",";
-  json += "\"fairy\":" + String(lampFairyState ? "true" : "false") + ",";
-  json += "\"fan\":" + String(lampFanState ? "true" : "false") + ",";
-  json += "\"backlight\":" + String(lampBackState ? "true" : "false");
-  json += "}";
+  char json[72];
+  snprintf(json, sizeof(json),
+           "{\"main\":%s,\"fairy\":%s,\"fan\":%s,\"backlight\":%s}",
+           lamps[0].on ? "true" : "false",
+           lamps[1].on ? "true" : "false",
+           lamps[2].on ? "true" : "false",
+           lamps[3].on ? "true" : "false");
   server.send(200, "application/json", json);
 }
 
-// Endpoint: GET /status for homebridge-web-thermostat compatibility
 void handleStatus() {
-  String json = "{";
-  json += "\"targetTemperature\":" + String(targetTemperature, 1) + ",";
-  json += "\"currentTemperature\":" + String(currentTemperature, 1) + ",";
-  json += "\"targetHeatingCoolingState\":" + String(targetHeatingCoolingState) + ",";
-  json += "\"currentHeatingCoolingState\":" + String(targetHeatingCoolingState);
-  json += "}";
+  char json[128];
+  snprintf(json, sizeof(json),
+           "{\"targetTemperature\":%.1f,\"currentTemperature\":%.1f,"
+           "\"targetHeatingCoolingState\":%d,\"currentHeatingCoolingState\":%d}",
+           targetTemperature, targetTemperature,
+           targetHeatingCoolingState, targetHeatingCoolingState);
   server.send(200, "application/json", json);
 }
 
-// Endpoint: GET /targetTemperature?value=X
 void handleSetTargetTemp() {
-  if (server.hasArg("value")) {
-    float rawVal = server.arg("value").toFloat();
-    float roundedVal = round(rawVal);  // Round to whole number
+  float requested;
+  if (readNumberArg("value", requested)) {
+    float target = clampAcTemp(requested);
+    int steps = (int)lroundf(target - targetTemperature);
 
-    // Increased max temperature to 34.0
-    if (roundedVal >= 16.0 && roundedVal <= 34.0) {
-      int steps = (int)(roundedVal - targetTemperature);
-
-      if (steps != 0) {
-        // Check if we need to wake up the AC display
-        bool needsWakeup = (millis() - last_ac_temp_time > AC_WAKEUP_TIMEOUT) || (last_ac_temp_time == 0);
-
-        if (steps > 0) {
-          if (needsWakeup) {
-            sendAcIR(AC_CODE_TEMP_UP);
-            delay(250);
-            Serial.println("IR: Temp UP (Wakeup Press)");
-          }
-          for (int i = 0; i < steps; i++) {
-            sendAcIR(AC_CODE_TEMP_UP);
-            delay(250);
-          }
-          Serial.printf("IR: Temp UP %d times\n", steps);
-        } else if (steps < 0) {
-          if (needsWakeup) {
-            sendAcIR(AC_CODE_TEMP_DOWN);
-            delay(250);
-            Serial.println("IR: Temp DOWN (Wakeup Press)");
-          }
-          for (int i = 0; i < abs(steps); i++) {
-            sendAcIR(AC_CODE_TEMP_DOWN);
-            delay(250);
-          }
-          Serial.printf("IR: Temp DOWN %d times\n", abs(steps));
-        }
-
-        targetTemperature = roundedVal;
-        currentTemperature = roundedVal;
-        last_ac_temp_time = millis();  // Reset the timer after interacting
+    if (steps != 0) {
+      // First press only wakes the AC display if asleep
+      bool needsWakeup = (irPendingAcTempPresses == 0) &&
+                         (last_ac_temp_time == 0 || (millis() - last_ac_temp_time > AC_WAKEUP_TIMEOUT));
+      if (needsWakeup) {
+        acPress(steps > 0 ? AC_CODE_TEMP_UP : AC_CODE_TEMP_DOWN, IR_GAP_AC_STEP);
       }
+      queueAcTempSteps(steps);
+      Serial.printf("IR: Temp %s %d steps%s -> %.0fC\n",
+                    steps > 0 ? "UP" : "DOWN", abs(steps),
+                    needsWakeup ? " (+1 wakeup press)" : "", target);
+
+      targetTemperature = target;
+      markAcStateDirty();
     }
   }
   server.send(200, "text/plain", "OK");
 }
 
-// Endpoint: GET /targetHeatingCoolingState?value=X
-// Values: 0=OFF, 1=HEAT, 2=COOL, 3=AUTO
+void applyAcState(int newState, bool force = false) {
+  bool currentlyOn = (targetHeatingCoolingState != 0);
+  bool wantOn = (newState != 0);
+
+  if (force || (currentlyOn != wantOn)) {
+    acPowerPress();
+    Serial.printf("IR: Transmitted AC power command (state: %d -> %d, force: %d)\n",
+                  targetHeatingCoolingState, newState, force);
+    if (wantOn) {
+      last_ac_temp_time = millis();  // AC was just turned on; display is awake
+    }
+  } else {
+    Serial.printf("State update: Re-affirmed state %d without duplicate power toggle\n", newState);
+  }
+  targetHeatingCoolingState = newState;
+  markAcStateDirty();
+}
+
 void handleSetTargetState() {
-  if (server.hasArg("value")) {
-    int newState = server.arg("value").toInt();
-
-    // Always trigger the IR toggle code to guarantee execution
-    sendAcIR(AC_CODE_POWER);
-    targetHeatingCoolingState = newState;
-    Serial.printf("IR: Transmitted AC power command (state: %d)\n", newState);
+  int newState;
+  bool force = server.hasArg("force") && (server.arg("force") == "1");
+  if (readStateArg("value", newState)) {
+    applyAcState(newState, force);
   }
   server.send(200, "text/plain", "OK");
 }
 
-// Helper: Safely transition to specified Fan Speed (Low=1, Mid=2, High=3)
+// The FAN button cycles downward (3 -> 2 -> 1 -> 3).
 void setFanSpeed(int targetLevel) {
-  if (targetLevel >= 1 && targetLevel <= 3) {
-    int steps = (fan_speed_level - targetLevel + 3) % 3;
-    for (int i = 0; i < steps; i++) {
-      sendAcIR(AC_CODE_FAN);
-      delay(250);
-    }
-    fan_speed_level = targetLevel;
-    Serial.printf("IR: Set Fan Speed to level %d (%d press(es))\n", targetLevel, steps);
-  }
+  if (targetLevel < 1 || targetLevel > 3) return;
+  int steps = (fan_speed_level - targetLevel + 3) % 3;
+  for (int i = 0; i < steps; i++) acPress(AC_CODE_FAN, IR_GAP_AC_STEP);
+  fan_speed_level = targetLevel;
+  markAcStateDirty();
+  Serial.printf("IR: Set Fan Speed to level %d (%d press(es))\n", targetLevel, steps);
 }
 
-// Helper: Evaluates HSV parameters and sends the closest matches
+void setSwing(bool on) {
+  if (swing_state == on) return;
+  acPress(AC_CODE_SWING, IR_GAP_SINGLE);
+  swing_state = on;
+  markAcStateDirty();
+}
+
+void setEco(bool on) {
+  if (eco_state == on) return;
+  acPress(AC_CODE_ECO, IR_GAP_SINGLE);
+  eco_state = on;
+  markAcStateDirty();
+}
+
+int timerRemainingPct(bool active, unsigned long startTime, unsigned long durationMs, unsigned long fullScaleMs) {
+  if (!active) return 0;
+  unsigned long elapsed = millis() - startTime;
+  if (elapsed >= durationMs) return 0;
+  int pct = (int)lroundf((float)(durationMs - elapsed) * 100.0f / (float)fullScaleMs);
+  return pct < 1 ? 1 : pct;
+}
+
+uint32_t ledColorCode(int hue, int sat) {
+  if (sat < 12) return LED_WHITE;
+  if (hue < 15) return LED_RED;
+  if (hue < 30) return LED_ORANGE;
+  if (hue < 45) return LED_LTORANGE;
+  if (hue < 55) return LED_YELLOR;
+  if (hue < 65) return LED_YELLOW;
+  if (hue < 100) return LED_LTGREEN;
+  if (hue < 140) return LED_GREEN;
+  if (hue < 170) return LED_DKCYAN;
+  if (hue < 200) return LED_CYAN;
+  if (hue < 215) return LED_LTBLUE;
+  if (hue < 235) return LED_BLUE;
+  if (hue < 255) return LED_DKBLUE;
+  if (hue < 290) return LED_PURPLE;
+  if (hue < 310) return LED_MAGENTA;
+  if (hue < 330) return LED_PINK;
+  return LED_RED;
+}
+
 void updateStripColorHSV() {
   if (!led_power) return;
-  last_led_command_time = millis();  // Reset 1-hour timer whenever we update color
+  last_led_command_time = millis();
+  ledPress(ledColorCode(led_hue, led_saturation), IR_GAP_SINGLE);
+}
 
-  if (led_saturation < 12) {
-    sendLedIR(LED_WHITE);
-    return;
-  }
-
-  if (led_hue >= 0 && led_hue < 15) {
-    sendLedIR(LED_RED);
-  } else if (led_hue >= 15 && led_hue < 30) {
-    sendLedIR(LED_ORANGE);
-  } else if (led_hue >= 30 && led_hue < 45) {
-    sendLedIR(LED_LTORANGE);
-  } else if (led_hue >= 45 && led_hue < 65) {
-    if (led_hue < 55) sendLedIR(LED_YELLOR);
-    else sendLedIR(LED_YELLOW);
-  } else if (led_hue >= 65 && led_hue < 140) {
-    if (led_hue < 100) sendLedIR(LED_LTGREEN);
-    else sendLedIR(LED_GREEN);
-  } else if (led_hue >= 140 && led_hue < 200) {
-    if (led_hue < 170) sendLedIR(LED_DKCYAN);
-    else sendLedIR(LED_CYAN);
-  } else if (led_hue >= 200 && led_hue < 255) {
-    if (led_hue < 215) sendLedIR(LED_LTBLUE);
-    else if (led_hue < 235) sendLedIR(LED_BLUE);
-    else sendLedIR(LED_DKBLUE);
-  } else if (led_hue >= 255 && led_hue < 330) {
-    if (led_hue < 290) sendLedIR(LED_PURPLE);
-    else if (led_hue < 310) sendLedIR(LED_MAGENTA);
-    else sendLedIR(LED_PINK);
-  } else if (led_hue >= 330 && led_hue <= 360) {
-    sendLedIR(LED_RED);
+void applyLedModeOrColor() {
+  last_led_command_time = millis();
+  switch (led_mode_level) {
+    case 2: ledPress(LED_FLASH, IR_GAP_SINGLE); break;
+    case 3: ledPress(LED_STROBE, IR_GAP_SINGLE); break;
+    case 4: ledPress(LED_FADE, IR_GAP_SINGLE); break;
+    case 5: ledPress(LED_SMOOTH, IR_GAP_SINGLE); break;
+    default: updateStripColorHSV(); break;
   }
 }
 
-// Endpoint: LED JSON status
 void handleLEDStatus() {
-  String json = "{";
-  json += "\"power\":" + String(led_power ? "true" : "false") + ",";
-  json += "\"brightness\":" + String(led_brightness) + ",";
-  json += "\"hue\":" + String(led_hue) + ",";
-  json += "\"saturation\":" + String(led_saturation) + ",";
-  json += "\"mode\":" + String(led_mode_level) + ",";
-  json += "\"speed\":" + String(led_speed_level);
-  json += "}";
+  char json[96];
+  snprintf(json, sizeof(json),
+           "{\"power\":%s,\"brightness\":%d,\"hue\":%d,\"saturation\":%d,\"mode\":%d,\"speed\":%d}",
+           led_power ? "true" : "false", led_brightness, led_hue,
+           led_saturation, led_mode_level, led_speed_level);
   server.send(200, "application/json", json);
+}
+
+static const char* getAuthModeName(wifi_auth_mode_t auth) {
+  switch (auth) {
+    case WIFI_AUTH_OPEN: return "OPEN";
+    case WIFI_AUTH_WEP: return "WEP";
+    case WIFI_AUTH_WPA_PSK: return "WPA_PSK";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2_PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2_ENT";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3_PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+    default: return "UNKNOWN";
+  }
 }
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("\n--- ESP32 HomeKit Controller Booting ---");
+  Serial.printf("Reset reason core 0: %d, core 1: %d\n", rtc_get_reset_reason(0), rtc_get_reset_reason(1));
+
+  // Set all relays HIGH (OFF) before setting pinMode to prevent boot clicks/glitches
+  for (size_t i = 0; i < LAMP_COUNT; i++) {
+    digitalWrite(lamps[i].pin, HIGH);
+    pinMode(lamps[i].pin, OUTPUT);
+  }
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-
-  // --- Relay / Lamp pin setup ---
-  pinMode(relayMain, OUTPUT);
-  pinMode(relayFairy, OUTPUT);
-  pinMode(relayFan, OUTPUT);
-  pinMode(relayBack, OUTPUT);
-
-  // Set all relays HIGH (OFF) by default so they don't turn on during boot
-  digitalWrite(relayMain, HIGH);
-  digitalWrite(relayFairy, HIGH);
-  digitalWrite(relayFan, HIGH);
-  digitalWrite(relayBack, HIGH);
 
   // Initialize both IR transmitters
   irsendAC.begin();
   irsendLED.begin();
 
-  // --- Thermal / Power Management ---
-  // Run at 80 MHz instead of the default 240 MHz: still fast enough for HTTP + IR
-  // but cuts active CPU power draw by ~50%, lowering silicon temp by 10-15 °C.
-  setCpuFrequencyMhz(80);
-
-  // Reset Wi-Fi stack & clear stale NVS connection cache
-  WiFi.persistent(false);
-  WiFi.disconnect(true, true);
-  delay(200);
-
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
+  delay(100);
 
   Serial.print("ESP32 MAC: ");
   Serial.println(WiFi.macAddress());
 
+  WiFi.setSleep(false);
+
+  // 7. Event listener
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
       Serial.println("\n[WiFi] Associated to AP successfully.");
@@ -323,23 +502,57 @@ void setup() {
       Serial.print("\n[WiFi] Got IP: ");
       Serial.println(IPAddress(info.got_ip.ip_info.ip.addr));
     } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-      Serial.printf("\n[WiFi] Disconnected! Reason code: %d\n", info.wifi_sta_disconnected.reason);
+      uint8_t r = info.wifi_sta_disconnected.reason;
+      Serial.printf("\n[WiFi] Disconnected! Reason code: %d\n", r);
     }
   });
 
-  Serial.printf("Connecting to SSID: %s\n", ssid);
+  // --- Deterministic Wi-Fi Configuration ---
+  // Static IP bypasses DHCP broadcast delay and collisions completely
+  IPAddress local_IP(192, 168, 1, 112);
+  IPAddress gateway(192, 168, 1, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress dns(192, 168, 1, 1);
+  WiFi.config(local_IP, gateway, subnet, dns);
+
+  // Allow internal voltage regulators and crypto RNG to settle before RF connection
+  delay(500);
+
+  Serial.printf("\nConnecting to Wi-Fi SSID: '%s'...\n", ssid);
   WiFi.begin(ssid, password);
-  unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
     delay(500);
     Serial.print(".");
+    retries++;
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.printf("\nWiFi not connected yet (status=%d). Proceeding to loop with self-healing watchdog...\n", WiFi.status());
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n[WiFi] Re-attempting connection...");
+    WiFi.disconnect(false);
+    delay(200);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+  }
+
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Gateway: ");
+  Serial.println(WiFi.gatewayIP());
+  Serial.print("RSSI: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+
+
+  // Start mDNS
+  if (MDNS.begin("esp32-homekit")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS responder started: esp32-homekit.local");
   }
 
   // --- AC THERMOSTAT COMPATIBLE ROUTES ---
@@ -347,118 +560,144 @@ void setup() {
   server.on("/targetTemperature", HTTP_GET, handleSetTargetTemp);
   server.on("/targetHeatingCoolingState", HTTP_GET, handleSetTargetState);
 
-  // --- VIRTUAL STATEFUL ROUTING FOR SWING, MODE, FAN, ECO ---
-  server.on("/ac/swing", HTTP_GET, []() {
-    sendAcIR(AC_CODE_SWING);
-    swing_state = !swing_state;  // Toggle tracked swing state
-    server.send(200, "text/plain", swing_state ? "1" : "0");
+  // Raw helper endpoints for proxy calibration & swap control
+  server.on("/set_state_memory", HTTP_GET, []() {
+    irFlush();
+    float temp;
+    int state;
+    if (readNumberArg("temp", temp)) targetTemperature = clampAcTemp(temp);
+    if (readStateArg("state", state)) targetHeatingCoolingState = state;
+    markAcStateDirty();
+    server.send(200, "text/plain", "OK");
   });
 
+  server.on("/send_raw_power", HTTP_GET, []() {
+    acPowerPress();
+    irFlush();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/raw_temp_steps", HTTP_GET, []() {
+    float requested;
+    if (readNumberArg("target", requested)) {
+      float target = clampAcTemp(requested);
+      queueAcTempSteps((int)lroundf(target - targetTemperature));
+      targetTemperature = target;
+      markAcStateDirty();
+    }
+    irFlush();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/set_state_raw", HTTP_GET, []() {
+    int newState;
+    if (readStateArg("state", newState)) applyAcState(newState, true);
+    irFlush();
+    server.send(200, "text/plain", "OK");
+  });
+
+  // --- AC SWING, ECO, MODE, FAN ROUTES ---
+  server.on("/ac/swing", HTTP_GET, []() {
+    setSwing(!swing_state);
+    server.send(200, "text/plain", swing_state ? "1" : "0");
+  });
+  server.on("/ac/swing/on", HTTP_GET, []() {
+    setSwing(true);
+    server.send(200, "text/plain", "1");
+  });
+  server.on("/ac/swing/off", HTTP_GET, []() {
+    setSwing(false);
+    server.send(200, "text/plain", "0");
+  });
   server.on("/ac/swing/status", HTTP_GET, []() {
     server.send(200, "text/plain", swing_state ? "1" : "0");
   });
 
   server.on("/ac/eco", HTTP_GET, []() {
-    sendAcIR(AC_CODE_ECO);
-    eco_state = !eco_state;  // Toggle tracked eco state
+    setEco(!eco_state);
     server.send(200, "text/plain", eco_state ? "1" : "0");
   });
-
+  server.on("/ac/eco/on", HTTP_GET, []() {
+    setEco(true);
+    server.send(200, "text/plain", "1");
+  });
+  server.on("/ac/eco/off", HTTP_GET, []() {
+    setEco(false);
+    server.send(200, "text/plain", "0");
+  });
   server.on("/ac/eco/status", HTTP_GET, []() {
     server.send(200, "text/plain", eco_state ? "1" : "0");
   });
 
-  // Cycle endpoints
   server.on("/ac/mode", HTTP_GET, []() {
-    sendAcIR(AC_CODE_MODE);
-    ac_mode_level = (ac_mode_level % 3) + 1;  // cycle 1 -> 2 -> 3
+    acPress(AC_CODE_MODE, IR_GAP_SINGLE);
+    ac_mode_level = (ac_mode_level % 3) + 1;
+    markAcStateDirty();
+    server.send(200, "text/plain", String(ac_mode_level));
+  });
+  server.on("/ac/mode/status", HTTP_GET, []() {
     server.send(200, "text/plain", String(ac_mode_level));
   });
 
   server.on("/ac/fan", HTTP_GET, []() {
-    sendAcIR(AC_CODE_FAN);
-    // Cycle downward: 3 -> 2 -> 1 -> 3
+    acPress(AC_CODE_FAN, IR_GAP_SINGLE);
+    // Button cycles downward: 3 -> 2 -> 1 -> 3
     fan_speed_level = (fan_speed_level == 1) ? 3 : fan_speed_level - 1;
+    markAcStateDirty();
+    server.send(200, "text/plain", String(fan_speed_level));
+  });
+  server.on("/ac/fan/status", HTTP_GET, []() {
     server.send(200, "text/plain", String(fan_speed_level));
   });
 
-  // Fan active validation status (forces plugin responsiveness)
   server.on("/ac/fan/active", HTTP_GET, []() {
     server.send(200, "text/plain", "1");
   });
 
-  // Native Fan Speed Percentages (0-100%) mapped to Low, Mid, High
   server.on("/ac/fan/speed", HTTP_GET, []() {
-    if (server.hasArg("value")) {
-      int pct = server.arg("value").toInt();
+    float pct;
+    if (readNumberArg("value", pct)) {
       int targetLevel = 1;
-      if (pct > 33 && pct <= 66) targetLevel = 2;
-      else if (pct > 66) targetLevel = 3;
-
+      if (pct > 66) targetLevel = 3;
+      else if (pct > 33) targetLevel = 2;
       setFanSpeed(targetLevel);
     }
-    // Report back standard levels: 33%, 66%, or 99%
     server.send(200, "text/plain", String(fan_speed_level * 33));
   });
-
   server.on("/ac/fan/speed/status", HTTP_GET, []() {
     server.send(200, "text/plain", String(fan_speed_level * 33));
   });
 
   // --- AC Timer Control Endpoints ---
-  // Maps 0-100% slider to 0-24 hours in 0.5 hour increments
   server.on("/ac/timer", HTTP_GET, []() {
-    if (server.hasArg("value")) {
-      int pct = server.arg("value").toInt();
-      float hours = round((pct * 24.0 / 100.0) * 2.0) / 2.0;  // round to 0.5hr steps
+    float pct;
+    if (readNumberArg("value", pct)) {
+      pct = constrain(pct, 0.0f, 100.0f);
+      float hours = roundf(pct * 24.0f / 100.0f * 2.0f) / 2.0f;
 
-      if (hours > 0.0) {
-        timer_duration_ms = (unsigned long)(hours * 3600.0 * 1000.0);
+      if (hours > 0.0f) {
+        timer_duration_ms = (unsigned long)(hours * 3600.0f * 1000.0f);
         timer_start_time = millis();
         timer_active = true;
-        Serial.printf("Timer: Set AC to shutoff in %.1f hour(s)\n", hours);
+        Serial.printf("Timer: Set AC shutoff in %.1f hour(s)\n", hours);
       } else {
         timer_active = false;
         Serial.println("Timer: Disabled");
       }
     }
-
-    // Return current remaining percentage
-    int responsePct = 0;
-    if (timer_active) {
-      unsigned long elapsed = millis() - timer_start_time;
-      if (timer_duration_ms > elapsed) {
-        float remaining_hours = (float)(timer_duration_ms - elapsed) / (3600.0 * 1000.0);
-        responsePct = (int)((remaining_hours / 24.0) * 100.0);
-      } else {
-        timer_active = false;  // clean up expired timer state on query
-      }
-    }
-    server.send(200, "text/plain", String(responsePct));
+    server.send(200, "text/plain",
+                String(timerRemainingPct(timer_active, timer_start_time, timer_duration_ms, AC_TIMER_FULL_SCALE_MS)));
   });
-
   server.on("/ac/timer/status", HTTP_GET, []() {
-    int responsePct = 0;
-    if (timer_active) {
-      unsigned long elapsed = millis() - timer_start_time;
-      if (timer_duration_ms > elapsed) {
-        float remaining_hours = (float)(timer_duration_ms - elapsed) / (3600.0 * 1000.0);
-        responsePct = (int)((remaining_hours / 24.0) * 100.0);
-      } else {
-        timer_active = false;  // clean up expired timer state on query
-      }
-    }
-    server.send(200, "text/plain", String(responsePct));
+    server.send(200, "text/plain",
+                String(timerRemainingPct(timer_active, timer_start_time, timer_duration_ms, AC_TIMER_FULL_SCALE_MS)));
   });
-
   server.on("/ac/timer/on", HTTP_GET, []() {
-    // Turning switch on defaults to a 1.0 hour timer
-    timer_duration_ms = (unsigned long)(1.0 * 3600.0 * 1000.0);
+    timer_duration_ms = 3600UL * 1000UL;  // Default 1 hour
     timer_start_time = millis();
     timer_active = true;
     server.send(200, "text/plain", "1");
   });
-
   server.on("/ac/timer/off", HTTP_GET, []() {
     timer_active = false;
     server.send(200, "text/plain", "0");
@@ -469,257 +708,178 @@ void setup() {
 
   server.on("/led/on", HTTP_GET, []() {
     led_power = true;
-    last_led_command_time = millis();
-    sendLedIR(LED_ON);
-
-    // Idea 2: Wait 250ms and push color sync to ensure LED starts in last chosen state
-    delay(250);
-    if (led_mode_level == 1) {
-      updateStripColorHSV();
-    } else {
-      // Re-trigger dynamic mode
-      if (led_mode_level == 2) sendLedIR(LED_FLASH);
-      else if (led_mode_level == 3) sendLedIR(LED_STROBE);
-      else if (led_mode_level == 4) sendLedIR(LED_FADE);
-      else if (led_mode_level == 5) sendLedIR(LED_SMOOTH);
-    }
+    ledPress(LED_ON, IR_GAP_LED_POWER_ON);
+    applyLedModeOrColor();
     server.send(200, "text/plain", "1");
   });
 
   server.on("/led/off", HTTP_GET, []() {
     led_power = false;
     last_led_command_time = millis();
-    sendLedIR(LED_OFF);
+    ledPress(LED_OFF, IR_GAP_SINGLE);
     server.send(200, "text/plain", "0");
   });
 
   server.on("/led/hue", HTTP_GET, []() {
-    if (server.hasArg("value")) {
-      led_hue = server.arg("value").toInt();
-      led_mode_level = 1;  // Change back to Solid mode upon color select
+    float v;
+    if (readNumberArg("value", v)) {
+      led_hue = constrain((int)lroundf(v), 0, 360);
+      led_mode_level = 1;
       updateStripColorHSV();
     }
     server.send(200, "text/plain", String(led_hue));
   });
 
   server.on("/led/saturation", HTTP_GET, []() {
-    if (server.hasArg("value")) {
-      led_saturation = server.arg("value").toInt();
-      led_mode_level = 1;  // Change back to Solid mode
+    float v;
+    if (readNumberArg("value", v)) {
+      led_saturation = constrain((int)lroundf(v), 0, 100);
+      led_mode_level = 1;
       updateStripColorHSV();
     }
     server.send(200, "text/plain", String(led_saturation));
   });
 
   server.on("/led/brightness", HTTP_GET, []() {
-    if (server.hasArg("value")) {
-      int targetBri = server.arg("value").toInt();
-      int steps = (targetBri - led_brightness) / 10;
-      if (steps > 0) {
-        for (int i = 0; i < steps; i++) {
-          sendLedIR(LED_BRI_UP);
-          delay(100);
-        }
-      } else if (steps < 0) {
-        for (int i = 0; i < abs(steps); i++) {
-          sendLedIR(LED_BRI_DWN);
-          delay(100);
-        }
-      }
+    float v;
+    if (readNumberArg("value", v)) {
+      int targetBri = constrain((int)lroundf(v), 0, 100);
+      int steps = (targetBri + 5) / 10 - (led_brightness + 5) / 10;
+      uint32_t code = (steps > 0) ? LED_BRI_UP : LED_BRI_DWN;
+      for (int i = abs(steps); i > 0; i--) ledPress(code, IR_GAP_LED_STEP);
       led_brightness = targetBri;
-      last_led_command_time = millis();  // Reset timer for brightness changes too
+      last_led_command_time = millis();
     }
     server.send(200, "text/plain", String(led_brightness));
   });
 
-  // Cycle LED Modes: 1=Solid, 2=Flash, 3=Strobe, 4=Fade, 5=Smooth
   server.on("/led/mode", HTTP_GET, []() {
-    led_mode_level = (led_mode_level % 5) + 1;  // cycle 1 -> 2 -> 3 -> 4 -> 5 -> 1
-    if (led_mode_level == 1) {
-      updateStripColorHSV();  // revert to last selected solid color
-    } else if (led_mode_level == 2) {
-      sendLedIR(LED_FLASH);
-    } else if (led_mode_level == 3) {
-      sendLedIR(LED_STROBE);
-    } else if (led_mode_level == 4) {
-      sendLedIR(LED_FADE);
-    } else if (led_mode_level == 5) {
-      sendLedIR(LED_SMOOTH);
-    }
+    led_mode_level = (led_mode_level % 5) + 1;
+    applyLedModeOrColor();
     server.send(200, "text/plain", String(led_mode_level));
   });
-
   server.on("/led/mode/status", HTTP_GET, []() {
     server.send(200, "text/plain", String(led_mode_level));
   });
 
-  // Idea 1: Speed cycle endpoint
   server.on("/led/speed", HTTP_GET, []() {
-    led_speed_level = (led_speed_level % 3) + 1;  // Cycle: 1 (Slow) -> 2 (Med) -> 3 (Fast)
-    if (led_speed_level == 1) {
-      // Send speed down a few times to guarantee slowest speed
-      for (int i = 0; i < 4; i++) {
-        sendLedIR(LED_BRI_DWN);
-        delay(100);
-      }
-    } else if (led_speed_level == 2) {
-      // Speed up to medium
-      for (int i = 0; i < 4; i++) {
-        sendLedIR(LED_BRI_DWN);
-        delay(100);
-      }
-      sendLedIR(LED_BRI_UP);
-      delay(100);
-      sendLedIR(LED_BRI_UP);
-    } else if (led_speed_level == 3) {
-      // Speed up to maximum
-      for (int i = 0; i < 4; i++) {
-        sendLedIR(LED_BRI_UP);
-        delay(100);
+    led_speed_level = (led_speed_level % 3) + 1;
+    if (led_speed_level == 3) {
+      for (int i = 0; i < 4; i++) ledPress(LED_BRI_UP, IR_GAP_LED_STEP);
+    } else {
+      for (int i = 0; i < 4; i++) ledPress(LED_BRI_DWN, IR_GAP_LED_STEP);
+      if (led_speed_level == 2) {
+        ledPress(LED_BRI_UP, IR_GAP_LED_STEP);
+        ledPress(LED_BRI_UP, IR_GAP_LED_STEP);
       }
     }
     server.send(200, "text/plain", String(led_speed_level));
   });
-
   server.on("/led/speed/status", HTTP_GET, []() {
     server.send(200, "text/plain", String(led_speed_level));
   });
 
-  // Idea 3: Soft Turn-Off Sleep Timer Endpoint (0-100% maps to 0-120 minutes)
   server.on("/led/timer", HTTP_GET, []() {
-    if (server.hasArg("value")) {
-      int pct = server.arg("value").toInt();
-      float minutes = pct * 1.2;  // 0-100% -> 0-120 minutes
-      if (minutes > 0.0) {
-        led_timer_duration_ms = (unsigned long)(minutes * 60.0 * 1000.0);
+    float pct;
+    if (readNumberArg("value", pct)) {
+      float minutes = constrain(pct, 0.0f, 100.0f) * 1.2f;
+      if (minutes > 0.0f) {
+        led_timer_duration_ms = (unsigned long)(minutes * 60.0f * 1000.0f);
         led_timer_start_time = millis();
         led_timer_active = true;
-        Serial.printf("LED Timer: Set lights to shutoff in %.1f minute(s)\n", minutes);
+        Serial.printf("LED Timer: Set lights shutoff in %.1f minute(s)\n", minutes);
       } else {
         led_timer_active = false;
       }
     }
-    int responsePct = 0;
-    if (led_timer_active) {
-      unsigned long elapsed = millis() - led_timer_start_time;
-      if (led_timer_duration_ms > elapsed) {
-        float remaining = (float)(led_timer_duration_ms - elapsed) / (60.0 * 1000.0);
-        responsePct = (int)((remaining / 120.0) * 100.0);
-      }
-    }
-    server.send(200, "text/plain", String(responsePct));
+    server.send(200, "text/plain",
+                String(timerRemainingPct(led_timer_active, led_timer_start_time, led_timer_duration_ms, LED_TIMER_FULL_SCALE_MS)));
   });
-
   server.on("/led/timer/status", HTTP_GET, []() {
-    int responsePct = 0;
-    if (led_timer_active) {
-      unsigned long elapsed = millis() - led_timer_start_time;
-      if (led_timer_duration_ms > elapsed) {
-        float remaining = (float)(led_timer_duration_ms - elapsed) / (60.0 * 1000.0);
-        responsePct = (int)((remaining / 120.0) * 100.0);
-      } else {
-        led_timer_active = false;
-      }
-    }
-    server.send(200, "text/plain", String(responsePct));
+    server.send(200, "text/plain",
+                String(timerRemainingPct(led_timer_active, led_timer_start_time, led_timer_duration_ms, LED_TIMER_FULL_SCALE_MS)));
   });
 
-  // --- Lamp / Relay Endpoints (Main, Fairy Light, Fan, Backlight) ---
+  // --- Lamp / Relay Endpoints (Named & Numbered) ---
   server.on("/lamps/status", HTTP_GET, handleLampsStatus);
 
-  // Main
-  server.on("/lamp/main/on", HTTP_GET, []() {
-    setLamp(relayMain, lampMainState, true);
-    server.send(200, "text/plain", "1");
-  });
-  server.on("/lamp/main/off", HTTP_GET, []() {
-    setLamp(relayMain, lampMainState, false);
-    server.send(200, "text/plain", "0");
-  });
-  server.on("/lamp/main/status", HTTP_GET, []() {
-    server.send(200, "text/plain", lampMainState ? "1" : "0");
-  });
+  for (size_t i = 0; i < LAMP_COUNT; i++) {
+    // Named: /lamp/main, /lamp/fairy, /lamp/fan, /lamp/backlight
+    String baseNamed = String("/lamp/") + lamps[i].name;
+    server.on(baseNamed + "/on", HTTP_GET, [i]() {
+      setLamp(i, true);
+      server.send(200, "text/plain", "1");
+    });
+    server.on(baseNamed + "/off", HTTP_GET, [i]() {
+      setLamp(i, false);
+      server.send(200, "text/plain", "0");
+    });
+    server.on(baseNamed + "/status", HTTP_GET, [i]() {
+      server.send(200, "text/plain", lamps[i].on ? "1" : "0");
+    });
 
-  // Fairy Light
-  server.on("/lamp/fairy/on", HTTP_GET, []() {
-    setLamp(relayFairy, lampFairyState, true);
-    server.send(200, "text/plain", "1");
-  });
-  server.on("/lamp/fairy/off", HTTP_GET, []() {
-    setLamp(relayFairy, lampFairyState, false);
-    server.send(200, "text/plain", "0");
-  });
-  server.on("/lamp/fairy/status", HTTP_GET, []() {
-    server.send(200, "text/plain", lampFairyState ? "1" : "0");
-  });
-
-  // Fan (Relay 3 on GPIO 33)
-  server.on("/lamp/fan/on", HTTP_GET, []() {
-    setLamp(relayFan, lampFanState, true);
-    server.send(200, "text/plain", "1");
-  });
-  server.on("/lamp/fan/off", HTTP_GET, []() {
-    setLamp(relayFan, lampFanState, false);
-    server.send(200, "text/plain", "0");
-  });
-  server.on("/lamp/fan/status", HTTP_GET, []() {
-    server.send(200, "text/plain", lampFanState ? "1" : "0");
-  });
-
-  // Backlight
-  server.on("/lamp/backlight/on", HTTP_GET, []() {
-    setLamp(relayBack, lampBackState, true);
-    server.send(200, "text/plain", "1");
-  });
-  server.on("/lamp/backlight/off", HTTP_GET, []() {
-    setLamp(relayBack, lampBackState, false);
-    server.send(200, "text/plain", "0");
-  });
-  server.on("/lamp/backlight/status", HTTP_GET, []() {
-    server.send(200, "text/plain", lampBackState ? "1" : "0");
-  });
+    // Numbered: /lamp/1, /lamp/2, /lamp/3, /lamp/4
+    String baseNum = String("/lamp/") + String(i + 1);
+    server.on(baseNum + "/on", HTTP_GET, [i]() {
+      setLamp(i, true);
+      server.send(200, "text/plain", "1");
+    });
+    server.on(baseNum + "/off", HTTP_GET, [i]() {
+      setLamp(i, false);
+      server.send(200, "text/plain", "0");
+    });
+    server.on(baseNum + "/status", HTTP_GET, [i]() {
+      server.send(200, "text/plain", lamps[i].on ? "1" : "0");
+    });
+  }
 
   // --- Arduino OTA Config ---
-  ArduinoOTA.setHostname("esp32-ir-controller");
+  ArduinoOTA.setHostname("esp32-homekit");
   ArduinoOTA.begin();
 
   server.begin();
+  Serial.println("HTTP server started. System ready!");
 }
 
 void loop() {
   server.handleClient();
   ArduinoOTA.handle();
 
-  // --- Wi-Fi Health Check & Self-Healing Watchdog ---
-  static unsigned long lastWifiCheck = 0;
-  static unsigned long wifiDisconnectedSince = 0;
-  unsigned long currentMillis = millis();
+  irSendNext();
 
-  if (currentMillis - lastWifiCheck >= 5000) {
-    lastWifiCheck = currentMillis;
-    if (WiFi.status() != WL_CONNECTED) {
-      if (wifiDisconnectedSince == 0) {
-        wifiDisconnectedSince = currentMillis;
-        Serial.println("Wi-Fi connection lost.");
-      }
-      // Hardware watchdog: If disconnected for more than 45 seconds, hard restart the ESP32!
-      if (currentMillis - wifiDisconnectedSince > 45000UL) {
-        Serial.println("Wi-Fi lost for >45s. Hardware restart triggered!");
-        ESP.restart();
-      }
-    } else {
-      wifiDisconnectedSince = 0;
+  // Heartbeat logging every 10 seconds
+  if (millis() - last_heartbeat_time >= 10000UL) {
+    last_heartbeat_time = millis();
+    Serial.printf("[Heartbeat] Uptime: %lu s | WiFi RSSI: %d dBm | Free Heap: %u bytes\n",
+                  millis() / 1000, WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
+  }
+
+  // --- Wi-Fi Reconnect Watchdog ---
+  if (millis() - last_wifi_check_time >= WIFI_CHECK_INTERVAL_MS) {
+    last_wifi_check_time = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      wifi_down = false;
+    } else if (!wifi_down) {
+      wifi_down = true;
+      wifi_down_since = millis();
+      Serial.println("WiFi link down -- auto-reconnect active in background.");
+    } else if (millis() - wifi_down_since >= WIFI_HARD_REBOOT_TIMEOUT_MS) {
+      Serial.println("WiFi down > 3 minutes -- triggering hardware restart!");
+      ESP.restart();
+    } else if (millis() - wifi_down_since >= WIFI_RECONNECT_GRACE_MS) {
+      Serial.println("WiFi still down after grace period -- calling WiFi.reconnect()...");
+      WiFi.reconnect();
+      wifi_down_since = millis();  // Reset so we don't spam reconnect while negotiating!
     }
   }
 
-  // --- AC Background Timer ---
+  // --- AC Shutoff Timer ---
   if (timer_active && (millis() - timer_start_time >= timer_duration_ms)) {
     timer_active = false;
-
-    // Automatically power off the AC if it is currently tracked as ON
     if (targetHeatingCoolingState != 0) {
-      sendAcIR(AC_CODE_POWER);
+      acPowerPress();
       targetHeatingCoolingState = 0;
+      markAcStateDirty();
       Serial.println("Timer Expired: Sent IR AC Power Off command");
     }
   }
@@ -729,19 +889,23 @@ void loop() {
     led_timer_active = false;
     if (led_power) {
       led_power = false;
-      sendLedIR(LED_OFF);
+      ledPress(LED_OFF, IR_GAP_SINGLE);
       Serial.println("LED Timer Expired: Sent IR LED Power Off command");
     }
   }
 
-  // --- LED Hourly Refresh ---
+  // --- LED Hourly Keep-Alive Refresh ---
   if (led_power && (millis() - last_led_command_time >= LED_REFRESH_INTERVAL_MS)) {
     last_led_command_time = millis();
-    updateStripColorHSV();  // Re-emit the current color code to the LED strip
+    applyLedModeOrColor();
     Serial.println("LED: Hourly refresh command sent.");
   }
 
-  // Yield to FreeRTOS idle task so the CPU cores can enter wait-for-interrupt
-  // state between incoming HTTP requests instead of spinning at 100% load.
-  delay(5);
+  // --- Persist AC state to flash once adjustments settle ---
+  if (acStateDirty && millis() - acStateDirtyTime >= AC_STATE_SAVE_DELAY_MS) {
+    saveAcState();
+  }
+
+  // Yield to FreeRTOS idle task so CPU can enter wait-for-interrupt sleep
+  delay(2);
 }

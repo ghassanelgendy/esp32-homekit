@@ -13,27 +13,31 @@
             "onUrl": "http://YOUR_ESP32_IP/led/on?bg=true",
             "offUrl": "http://YOUR_ESP32_IP/led/off?bg=true",
             "statusUrl": "http://YOUR_ESP32_IP/led/status",
-            "statusPattern": "\"power\":true",
+            "statusPattern": "\"power\":\\s*true",
+            "statusCache": 0,
+            "brightnessCache": 0,
+            "hueCache": 0,
+            "saturationCache": 0,
             "brightness": {
                 "setUrl": "http://YOUR_ESP32_IP/led/brightness?value=%s",
                 "statusUrl": "http://YOUR_ESP32_IP/led/status",
-                "statusPattern": "\"brightness\":([0-9]+)",
+                "statusPattern": "\"brightness\":\\s*([0-9]+)",
                 "patternGroupToExtract": 1
             },
             "hue": {
                 "setUrl": "http://YOUR_ESP32_IP/led/hue?value=%s",
                 "statusUrl": "http://YOUR_ESP32_IP/led/status",
-                "statusPattern": "\"hue\":([0-9]+)",
+                "statusPattern": "\"hue\":\\s*([0-9]+)",
                 "patternGroupToExtract": 1
             },
             "saturation": {
                 "setUrl": "http://YOUR_ESP32_IP/led/saturation?value=%s",
                 "statusUrl": "http://YOUR_ESP32_IP/led/status",
-                "statusPattern": "\"saturation\":([0-9]+)",
+                "statusPattern": "\"saturation\":\\s*([0-9]+)",
                 "patternGroupToExtract": 1
             },
             "color": true,
-            "pullInterval": 5000
+            "pullInterval": 2000
         },
         {
             "accessory": "HTTP-SWITCH",
@@ -115,7 +119,8 @@
             "offUrl": "http://YOUR_ESP32_IP/lamp/1/off",
             "statusUrl": "http://YOUR_ESP32_IP/lamp/1/status",
             "statusPattern": "1",
-            "pullInterval": 5000
+            "statusCache": 0,
+            "pullInterval": 2000
         },
         {
             "accessory": "HTTP-SWITCH",
@@ -124,7 +129,8 @@
             "offUrl": "http://YOUR_ESP32_IP/lamp/2/off",
             "statusUrl": "http://YOUR_ESP32_IP/lamp/2/status",
             "statusPattern": "1",
-            "pullInterval": 5000
+            "statusCache": 0,
+            "pullInterval": 2000
         },
         {
             "accessory": "HTTP-SWITCH",
@@ -133,7 +139,8 @@
             "offUrl": "http://YOUR_ESP32_IP/lamp/3/off",
             "statusUrl": "http://YOUR_ESP32_IP/lamp/3/status",
             "statusPattern": "1",
-            "pullInterval": 5000
+            "statusCache": 0,
+            "pullInterval": 2000
         },
         {
             "accessory": "HTTP-SWITCH",
@@ -142,7 +149,8 @@
             "offUrl": "http://YOUR_ESP32_IP/lamp/4/off",
             "statusUrl": "http://YOUR_ESP32_IP/lamp/4/status",
             "statusPattern": "1",
-            "pullInterval": 5000
+            "statusCache": 0,
+            "pullInterval": 2000
         }
     ],
     "platforms": [

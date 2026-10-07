@@ -4,7 +4,7 @@
 #include <IRsend.h>
 #include <ArduinoOTA.h>
 
-const char* ssid = "Chromium";
+const char* ssid = "Platinum";
 const char* password = "017265P!!";
 
 // --- Dual IR Setup ---

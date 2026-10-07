@@ -84,12 +84,11 @@ def configure_playback():
     except Exception as e:
         print(f"Shuffle API warning: {e}")
 
-    # Load, repeat, play via MPD
+    # Load and repeat via MPD (do NOT auto-play)
     commands = [
         "clear",
         f"load \"file:/music/{PLAYLIST_NAME}\"",
         "repeat 1",
-        "play",
         "close"
     ]
     payload = "\n".join(commands) + "\n"

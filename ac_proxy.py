@@ -1,53 +1,61 @@
 #!/usr/bin/env python3
-import urllib.request
-import urllib.parse
-import json
+"""
+ac_proxy.py - Homebridge HTTP Bridge for ESP32 Room Controller.
+Bridges Homebridge (on this server) to the ESP32 wired via USB to the Room PC (192.168.1.110:8881).
+Also supports local USB connection as direct fallback.
+Zero Wi-Fi dependencies on the ESP32.
+"""
+
+import sys
 import os
 import time
+import datetime
+import json
+import glob
+import re
+import signal
 import threading
-import concurrent.futures
+from typing import Optional, Dict, Any
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import urllib.request
+import urllib.parse
 
-DEFAULT_ESP32_IP = os.environ.get("ESP32_IP", "192.168.1.112")
-ESP32_IP = DEFAULT_ESP32_IP
+# Configuration
 PORT = 8880
-DATA_DIR = "/data" if os.path.isdir("/data") else "/tmp"
+ROOM_BRIDGE_URL = os.environ.get("ROOM_BRIDGE_URL", "http://192.168.1.110:8882")
+DATA_DIR = "/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(__file__), "ac_proxy_data")
+os.makedirs(DATA_DIR, exist_ok=True)
 LOGS_DIR = "/logs" if os.path.isdir("/logs") else os.path.join(os.path.dirname(__file__), "logs")
-UNREACHABLE_LOG_FILE = os.path.join(LOGS_DIR, "esp32_failures.log")
-
-def log_esp32_failure(reason, path, target_ip, details=""):
-    try:
-        os.makedirs(LOGS_DIR, exist_ok=True)
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        line = f"[{timestamp}] [FAILURE] IP: {target_ip} | Path: {path} | Reason: {reason} | Details: {details}\n"
-        with open(UNREACHABLE_LOG_FILE, "a") as f:
-            f.write(line)
-    except Exception as e:
-        print(f"[AC Proxy] Error writing to failure log: {e}")
+os.makedirs(LOGS_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOGS_DIR, "LOGSMAIN.log")
 
 STATE_FILE = os.path.join(DATA_DIR, "ac_last_temp.txt")
 FAN_LEVEL_STATE_FILE = os.path.join(DATA_DIR, "ac_last_fan_level.txt")
 SWAP_STATE_FILE = os.path.join(DATA_DIR, "ac_swap_state.json")
-LAST_DISCOVERY_TIME = 0
-DISCOVERY_COOLDOWN = 30  # seconds between discovery scans
 
+def format_ts() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+def write_and_sync(filepath: str, text: str):
+    try:
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Log Error] {e}", file=sys.stderr)
+
+# Global State
 lock = threading.Lock()
 is_calibrating = False
 active_target_temp = 24
-
-# Proxy-side cache of the AC's fan speed (1=Low, 2=Medium, 3=High), reported to
-# HomeKit/HA instead of the ESP32's own fan_speed_level. The ESP32 has no real
-# feedback from the AC (IR is one-way) and always boots believing Low, which
-# drifts from reality whenever the real fan speed doesn't match. Seeded to
-# High (3) here since that's the AC's actual current speed.
 fan_speed_level = 3
+virtual_state_override = None
 
 # AC / Fan Alternate Swap state
-# swap_interval_minutes is the configurable FAN-ON duration (set via the Duration
-# slider). AC-ON duration is intentionally shorter (AC draws far more power than
-# the fan): it scales as 1/6 of the Fan duration, clamped to 15-45 minutes, so a
-# "3 hour" swap means 3 hours Fan / 30 min AC, and a "5 hour" swap means 5 hours
-# Fan / 45 min AC -- never a symmetric split, but not stuck at a fixed 30 min either.
 swap_active = False
 swap_interval_minutes = 30.0
 AC_PHASE_MIN_MINUTES = 15.0
@@ -55,7 +63,7 @@ AC_PHASE_MAX_MINUTES = 45.0
 AC_PHASE_RATIO = 1.0 / 6.0
 swap_thread = None
 swap_stop_event = threading.Event()
-
+swap_update_event = threading.Event()
 swap_state_lock = threading.Lock()
 
 def save_swap_state(active, interval_minutes):
@@ -79,392 +87,9 @@ def load_swap_state():
     except Exception as e:
         print(f"[AC Proxy] Error loading swap state: {e}")
     return False
-# None means "trust the ESP32's live /status". Only ever set to a real 0/2 value
-# while the swap loop is actively forcing a phase; must be cleared back to None
-# as soon as that phase-forcing ends, otherwise /status keeps reporting a stale
-# cached state instead of what the AC/Fan are physically doing.
-virtual_state_override = None
 
 def get_ac_phase_minutes():
-    """ AC-ON duration for the swap loop: 1/6 of the current Fan duration,
-    clamped to 15-45 minutes. Read live (not cached) so a mid-loop duration
-    change also rescales the AC phase, not just the Fan phase. """
     return max(AC_PHASE_MIN_MINUTES, min(AC_PHASE_MAX_MINUTES, swap_interval_minutes * AC_PHASE_RATIO))
-
-esp32_io_lock = threading.Lock()
-_esp32_cache = {}
-ESP32_CACHE_TTL = 30.0  # seconds
-
-def fetch_esp32(path, timeout=2.0):
-    global ESP32_IP
-    now = time.time()
-    cached = _esp32_cache.get(path)
-
-    # 1. Fast path: Fresh cache hit
-    if cached and (now - cached[0] < ESP32_CACHE_TTL):
-        return cached[1]
-
-    # 2. Fast path: If requesting an individual lamp status, check bulk /lamps/status cache
-    if path.startswith("/lamp/") and path.endswith("/status"):
-        lamps_cached = _esp32_cache.get("/lamps/status")
-        if lamps_cached and (now - lamps_cached[0] < ESP32_CACHE_TTL):
-            try:
-                data = json.loads(lamps_cached[1].decode("utf-8"))
-                for k, v in data.items():
-                    _esp32_cache[f"/lamp/{k}/status"] = (lamps_cached[0], b"1" if v else b"0")
-                if path in _esp32_cache:
-                    return _esp32_cache[path][1]
-            except Exception:
-                pass
-
-    # 3. Never block during calibration - serve cached or safe fallback
-    if is_calibrating:
-        if cached:
-            return cached[1]
-        return b"{}" if path.endswith("/status") and "lamp" not in path else b"0"
-
-    # 4. Non-blocking lock acquisition:
-    # If the lock is held (e.g. action command in flight), NEVER stall client threads!
-    # Return stale cached data immediately if available.
-    acquired = esp32_io_lock.acquire(blocking=False)
-    if not acquired:
-        if cached:
-            return cached[1]
-        # Only wait briefly if we have never retrieved this endpoint before
-        if not esp32_io_lock.acquire(timeout=1.5):
-            if cached:
-                return cached[1]
-            raise TimeoutError(f"ESP32 busy on {path}")
-
-    try:
-        # Re-check cache in case another thread just updated it
-        cached = _esp32_cache.get(path)
-        if cached and (time.time() - cached[0] < ESP32_CACHE_TTL):
-            return cached[1]
-
-        url = f"http://{ESP32_IP}{path}"
-        try:
-            req = urllib.request.Request(url, headers={"Connection": "close"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = r.read()
-            t = time.time()
-            _esp32_cache[path] = (t, data)
-
-            # If bulk lamps status was fetched, populate individual caches
-            if path == "/lamps/status":
-                try:
-                    pdata = json.loads(data.decode("utf-8"))
-                    for k, v in pdata.items():
-                        _esp32_cache[f"/lamp/{k}/status"] = (t, b"1" if v else b"0")
-                except Exception:
-                    pass
-
-            return data
-        except Exception as e:
-            log_esp32_failure("FETCH_FAILED", path, ESP32_IP, str(e))
-            if cached:
-                return cached[1]
-            if path == "/lamps/status":
-                return b'{"main":false,"fairy":false,"fan":false,"backlight":false}'
-            elif path.startswith("/lamp/") or path.startswith("/led/"):
-                return b"0"
-            elif path == "/status":
-                return json.dumps({
-                    "targetTemperature": float(active_target_temp),
-                    "currentTemperature": float(active_target_temp),
-                    "targetHeatingCoolingState": 0,
-                    "currentHeatingCoolingState": 0
-                }).encode("utf-8")
-            raise e
-    finally:
-        esp32_io_lock.release()
-
-def send_esp32_cmd(path, timeout=2.0, retries=1):
-    """ Send an action command to the ESP32 synchronized with esp32_io_lock, with retries and Connection: close. """
-    global ESP32_IP
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            url = f"http://{ESP32_IP}{path}"
-            # Acquire lock with a brief wait so action commands don't queue up indefinitely
-            if not esp32_io_lock.acquire(timeout=4.0):
-                log_esp32_failure("LOCK_BUSY", path, ESP32_IP, f"attempt {attempt+1}/{retries+1}")
-                raise TimeoutError("ESP32 lock busy")
-            try:
-                req = urllib.request.Request(url, headers={"Connection": "close"})
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    data = r.read()
-                    # Optimistically update status cache immediately
-                    now = time.time()
-                    base = path.split("?", 1)[0]
-                    if base.startswith("/lamp/") and (base.endswith("/on") or base.endswith("/off")):
-                        parts = base.split("/")
-                        if len(parts) >= 4:
-                            lamp_name = parts[2]
-                            st = b"1" if base.endswith("/on") else b"0"
-                            _esp32_cache[f"/lamp/{lamp_name}/status"] = (now, st)
-                            _esp32_cache.pop("/lamps/status", None)
-                    elif base.startswith("/led/") and (base.endswith("/on") or base.endswith("/off")):
-                        st = b"1" if base.endswith("/on") else b"0"
-                        _esp32_cache["/led/status"] = (now, st)
-                    return data
-            finally:
-                esp32_io_lock.release()
-        except Exception as e:
-            last_err = e
-            log_esp32_failure(f"CMD_ATTEMPT_{attempt+1}_FAILED", path, ESP32_IP, str(e))
-            if attempt < retries:
-                # Brief backoff between retries to let ESP32 TCP stack clear
-                time.sleep(0.2)
-    log_esp32_failure("CMD_ALL_RETRIES_EXHAUSTED", path, ESP32_IP, str(last_err))
-    raise last_err
-
-def set_ac_raw_state(state, retries=1, force=True):
-    """ Turn AC state ON (2) or OFF (0) using targetHeatingCoolingState route on ESP32 with retries """
-    global virtual_state_override
-    try:
-        force_arg = "&force=1" if force else ""
-        result = send_esp32_cmd(f"/targetHeatingCoolingState?value={state}{force_arg}", timeout=2.0, retries=retries)
-        _esp32_cache.pop("/status", None)
-        virtual_state_override = int(state)
-        return result
-    except Exception as e:
-        print(f"[AC Proxy] Error setting raw AC state {state} after {retries} attempts: {e}")
-        return None
-
-def set_ac_memory_only(state):
-    """ Sync state tracking memory """
-    pass
-
-def set_fan_raw_state(state, retries=1):
-    """ Turn Fan ON (1) or OFF (0) using the ESP32's fan relay endpoint with retries """
-    endpoint = "on" if state == 1 else "off"
-    try:
-        result = send_esp32_cmd(f"/lamp/fan/{endpoint}", timeout=2.0, retries=retries)
-        _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if state == 1 else b"0")
-        _esp32_cache.pop("/lamps/status", None)
-        return result
-    except Exception as e:
-        print(f"[AC Proxy] Error setting fan state {state} after {retries} attempts: {e}")
-        return None
-
-def get_current_ac_state():
-    """ Returns True if AC is currently ON (state != 0), False otherwise """
-    global virtual_state_override
-    if virtual_state_override is not None:
-        return virtual_state_override != 0
-    try:
-        data = json.loads(fetch_esp32("/status").decode("utf-8"))
-        return data.get("targetHeatingCoolingState", 0) != 0
-    except Exception as e:
-        print(f"[AC Proxy] Error reading AC status: {e}")
-        return False
-
-def get_current_fan_state():
-    """ Returns True if Fan is currently ON, False otherwise """
-    try:
-        res = fetch_esp32("/lamp/fan/status").decode("utf-8").strip()
-        return res == "1" or res.lower() == "true"
-    except Exception as e:
-        print(f"[AC Proxy] Error reading Fan status: {e}")
-        return False
-
-swap_update_event = threading.Event()
-
-def ac_fan_swap_loop(minutes):
-    global swap_active, swap_interval_minutes
-    print(f"[AC Proxy] Starting AC / Fan swap loop (Interval: {minutes} minutes)...")
-    
-    ac_on = get_current_ac_state()
-    fan_on = get_current_fan_state()
-    
-    # Smart detection: Start with whichever appliance is currently ON without issuing IR commands or resetting state
-    global virtual_state_override
-    if ac_on and not fan_on:
-        print(f"[AC Proxy] Smart Swap Start: Detected AC is currently ON. Keeping AC ON, Fan OFF for {get_ac_phase_minutes():.0f} min AC phase.")
-        current_phase = "ac"
-    elif fan_on and not ac_on:
-        print(f"[AC Proxy] Smart Swap Start: Detected Fan is currently ON. Keeping Fan ON, AC OFF for {swap_interval_minutes:.0f} min Fan phase.")
-        current_phase = "fan"
-    elif fan_on and ac_on:
-        # Both ON: keep both running for one AC-phase interval first instead of
-        # immediately forcing AC off. After that interval: AC off (Fan stays on).
-        # From then on it's the normal Fan-phase / AC-phase alternation.
-        print(f"[AC Proxy] Smart Swap Start: Both AC and Fan are ON. Keeping both ON for {get_ac_phase_minutes():.0f} min before phasing AC off.")
-        current_phase = "both"
-    else:
-        # Both OFF: Turn Fan ON and keep AC OFF (no AC IR signals sent, it's already off)
-        print("[AC Proxy] Smart Swap Start: Both appliances are OFF. Turning Fan ON and starting swap timer.")
-        current_phase = "fan"
-        set_fan_raw_state(1)
-        # Ensure proxy software state knows AC is OFF without sending any AC IR signals
-        virtual_state_override = 0
-    
-    last_phase_time = time.time()
-    while not swap_stop_event.is_set():
-        elapsed = time.time() - last_phase_time
-        # "ac" (and the initial "both" hold, which ends with AC turning off) run for
-        # get_ac_phase_minutes(); "fan" (and "standby") run for the configurable
-        # swap_interval_minutes.
-        phase_minutes = get_ac_phase_minutes() if current_phase in ("ac", "both") else swap_interval_minutes
-        target_seconds = phase_minutes * 60.0
-        remaining = target_seconds - elapsed
-        
-        if remaining <= 0:
-            last_phase_time = time.time()
-            # Re-check live status right when interval expires
-            live_ac_on = get_current_ac_state()
-            live_fan_on = get_current_fan_state()
-            
-            # If both are off during standby and still off, stay in standby
-            if not live_ac_on and not live_fan_on and current_phase == "standby":
-                print("[AC Proxy] Swap Interval reached: Both appliances still OFF. Remaining in standby.")
-                continue
-
-            # First interval of a "both were on" start: turn AC off, leave Fan on,
-            # then fall into the normal AC<->Fan alternation from here on.
-            if current_phase == "both":
-                print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning AC OFF, Fan stays ON (Phase: Both -> Fan)...")
-                current_phase = "fan"
-                set_ac_raw_state(0, retries=3)
-                continue
-
-            # If AC is currently running (whether from initial phase or user manually turned it on), turn AC OFF and Fan ON
-            if live_ac_on or current_phase == "ac":
-                print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning AC OFF, Fan ON (Phase: AC -> Fan)...")
-                # HARD SAFETY GUARD: Never turn Fan on if AC power off command fails!
-                ac_res = set_ac_raw_state(0, retries=4)
-                if ac_res is None:
-                    print("[AC Proxy] WARNING: Failed to turn AC OFF during swap! ABORTING Fan activation to prevent both running. Retrying in 10s...")
-                    last_phase_time = time.time() - (target_seconds - 10.0)
-                    continue
-                time.sleep(1.0)
-                fan_res = set_fan_raw_state(1, retries=4)
-                if fan_res is None:
-                    print("[AC Proxy] WARNING: Failed to turn Fan ON during swap! Retrying in 10s...")
-                    last_phase_time = time.time() - (target_seconds - 10.0)
-                    continue
-                current_phase = "fan"
-            else:
-                print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning Fan OFF, AC ON (Phase: Fan -> AC)...")
-                # HARD SAFETY GUARD: Never turn AC on if Fan power off command fails!
-                fan_res = set_fan_raw_state(0, retries=4)
-                if fan_res is None:
-                    print("[AC Proxy] WARNING: Failed to turn Fan OFF during swap! ABORTING AC activation to prevent both running. Retrying in 10s...")
-                    last_phase_time = time.time() - (target_seconds - 10.0)
-                    continue
-                time.sleep(1.0)
-                ac_res = set_ac_raw_state(2, retries=4)
-                if ac_res is None:
-                    print("[AC Proxy] WARNING: Failed to turn AC ON during swap! Retrying in 10s...")
-                    last_phase_time = time.time() - (target_seconds - 10.0)
-                    continue
-                current_phase = "ac"
-            continue
-            
-        # Poll in short slices (instead of sleeping for the full `remaining` span)
-        # so that a live duration change takes effect within ~1s instead of only
-        # after whatever the OLD duration's wait was already committed to.
-        wait_slice = min(remaining, 1.0)
-        if swap_stop_event.wait(timeout=wait_slice):
-            break
-        if swap_update_event.is_set():
-            swap_update_event.clear()
-            print(f"[AC Proxy] Swap duration updated live -> now targeting {swap_interval_minutes} minute interval.")
-
-    print("[AC Proxy] AC / Fan swap loop stopped.")
-    swap_active = False
-
-def start_ac_fan_swap(minutes=None):
-    global swap_active, swap_thread, swap_stop_event, swap_update_event, swap_interval_minutes
-    if minutes is not None:
-        # Clamp to the documented 5-240 minute (up to 4h) Fan-duration range regardless
-        # of caller, so a bad or out-of-range value (e.g. from an HA helper with a
-        # wider scale) can't silently push the swap out to an absurd duration.
-        swap_interval_minutes = max(5.0, min(240.0, float(minutes)))
-    save_swap_state(True, swap_interval_minutes)
-    if swap_active:
-        print(f"[AC Proxy] Dynamic swap duration updated to {swap_interval_minutes} minutes.")
-        swap_update_event.set()
-        return
-    swap_stop_event.clear()
-    swap_update_event.clear()
-    swap_active = True
-    swap_thread = threading.Thread(target=ac_fan_swap_loop, args=(swap_interval_minutes,), daemon=True)
-    swap_thread.start()
-
-def stop_ac_fan_swap():
-    global swap_active, swap_stop_event, virtual_state_override
-    save_swap_state(False, swap_interval_minutes)
-    if swap_active:
-        print("[AC Proxy] Stopping AC / Fan swap loop...")
-        swap_active = False
-        swap_stop_event.set()
-        # Release the swap's forced status override now that it no longer owns
-        # AC/Fan state, so /status reports the real, live ESP32 state again.
-        virtual_state_override = None
-
-def discover_esp32():
-    global ESP32_IP, LAST_DISCOVERY_TIME
-    now = time.time()
-    if now - LAST_DISCOVERY_TIME < DISCOVERY_COOLDOWN:
-        return ESP32_IP
-    LAST_DISCOVERY_TIME = now
-
-    # First check current IP. Timeout is deliberately more forgiving than a plain
-    # "is it up" ping (the ESP32 is a single-threaded device and can be briefly
-    # slow to answer under Wi-Fi jitter or while mid-IR-send) -- a false negative
-    # here used to fall straight through to the very slow full subnet scan below
-    # for what was really just a transient blip, not an IP change.
-    try:
-        req = urllib.request.Request(f"http://{ESP32_IP}/status")
-        with urllib.request.urlopen(req, timeout=3.0) as r:
-            if r.status == 200:
-                return ESP32_IP
-    except Exception:
-        pass
-
-    # Check default IP if different
-    if ESP32_IP != DEFAULT_ESP32_IP:
-        try:
-            req = urllib.request.Request(f"http://{DEFAULT_ESP32_IP}/status")
-            with urllib.request.urlopen(req, timeout=1.5) as r:
-                if r.status == 200:
-                    ESP32_IP = DEFAULT_ESP32_IP
-                    print(f"[AC Proxy] Reconnected to ESP32 at default IP: {ESP32_IP}")
-                    return ESP32_IP
-        except Exception:
-            pass
-
-    # Subnet scan on 192.168.1.x -- probed CONCURRENTLY. Measured on this network,
-    # a sequential scan (one address at a time, 0.4s timeout each) takes ~98
-    # SECONDS end to end. Since discover_esp32() runs synchronously inside every
-    # status/command request's fallback path, that 98s stall was being read by
-    # HomeKit/Homebridge as the accessory going unresponsive -- which is what made
-    # the AC/Fan appear to randomly flip on/off every couple of minutes even
-    # though nothing physically changed. Running the probes in parallel keeps the
-    # worst case near the single 0.4s per-host timeout instead of 254x that.
-    def probe(i):
-        if i == 100:  # known non-ESP32 device that false-positives on /status
-            return None
-        ip = f"192.168.1.{i}"
-        try:
-            req = urllib.request.Request(f"http://{ip}/status")
-            with urllib.request.urlopen(req, timeout=0.4) as r:
-                body = r.read().decode(errors="ignore")
-                if "targetTemperature" in body or "targetHeatingCoolingState" in body:
-                    return ip
-        except Exception:
-            pass
-        return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
-        for result in pool.map(probe, range(1, 255)):
-            if result:
-                ESP32_IP = result
-                print(f"[AC Proxy] Discovered ESP32 at new IP: {ESP32_IP}")
-                return ESP32_IP
-    return ESP32_IP
 
 def load_last_temp():
     global active_target_temp
@@ -515,114 +140,579 @@ def save_fan_level(level):
 load_last_temp()
 load_last_fan_level()
 
+# =========================================================================
+#  COMMUNICATION LAYER (Local USB Serial Primary + Room PC Bridge Fallback)
+# =========================================================================
+
+try:
+    import serial
+    import serial.tools.list_ports
+    HAS_SERIAL = True
+except ImportError:
+    HAS_SERIAL = False
+
+last_serial_cmd_time = 0.0
+
+class LocalSerialManager:
+    def __init__(self):
+        self.ser = None
+        self.lock = threading.Lock()
+        self.connected = False
+        self.port = None
+
+    def find_port(self):
+        by_id = glob.glob("/dev/serial/by-id/usb-Silicon_Labs*") + glob.glob("/dev/serial/by-id/*")
+        if by_id:
+            try:
+                return os.path.realpath(by_id[0])
+            except Exception:
+                pass
+        devs = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        return devs[0] if devs else None
+
+    def connect(self):
+        if not HAS_SERIAL:
+            return False
+        port = self.find_port()
+        if not port:
+            self.close()
+            return False
+        if self.connected and self.ser and self.ser.is_open and self.port == port:
+            return True
+        try:
+            # Disable HUPCL (hangup-on-close) so DTR does not drop
+            os.system(f"stty -F {port} -hupcl 2>/dev/null")
+            ser = serial.Serial()
+            ser.port = port
+            ser.baudrate = 115200
+            ser.timeout = 0.6
+            ser.write_timeout = 0.6
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+            time.sleep(0.1)
+            ser.reset_input_buffer()
+            self.ser = ser
+            self.port = port
+            self.connected = True
+            print(f"[{format_ts()}] [LOCAL USB] Connected to ESP32 on {port} directly!")
+            write_and_sync(LOG_FILE, f"[{format_ts()}] [LOCAL USB] Connected to ESP32 on {port} directly!\n")
+            return True
+        except Exception as e:
+            self.close()
+            return False
+
+    def close(self):
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+        self.connected = False
+        self.port = None
+
+    def send_cmd(self, cmd: str, timeout: float = 0.8, retries: int = 2) -> str:
+        global last_serial_cmd_time
+        with self.lock:
+            last_serial_cmd_time = time.time()
+            if not self.connect():
+                raise ConnectionError("No local USB ESP32 connected")
+            for attempt in range(retries):
+                try:
+                    self.ser.reset_input_buffer()
+                    self.ser.write(f"{cmd.strip()}\n".encode("utf-8"))
+                    self.ser.flush()
+
+                    start = time.time()
+                    while time.time() - start < timeout:
+                        line = self.ser.readline().decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        if line.startswith("[EVENT]") or line.startswith("[ESP32]"):
+                            write_and_sync(LOG_FILE, f"[{format_ts()}] {line}\n")
+                            continue
+                        return line
+                    if attempt < retries - 1:
+                        time.sleep(0.05)
+                        continue
+                    # Command timed out: do NOT close port to prevent ESP32 reboot!
+                    print(f"[{format_ts()}] [Serial Timeout] Command '{cmd}' timed out after {timeout}s")
+                    return "ERR_TIMEOUT"
+                except (serial.SerialException, OSError) as e:
+                    if attempt < retries - 1:
+                        time.sleep(0.1)
+                        if self.connect():
+                            continue
+                    print(f"[{format_ts()}] [Serial Disconnect] Port error: {e}")
+                    self.close()
+                    raise e
+
+local_serial = LocalSerialManager()
+
+# Status Cache in Memory
+cache: Dict[str, Any] = {
+    "status": {
+        "targetTemperature": float(active_target_temp),
+        "currentTemperature": float(active_target_temp),
+        "targetHeatingCoolingState": 0,
+        "currentHeatingCoolingState": 0
+    },
+    "lamps": {"main": False, "fairy": False, "fan": False, "backlight": False},
+    "led": {"power": False, "brightness": 100, "hue": 0, "saturation": 0, "mode": 1, "speed": 1},
+    "ac_swing": "0",
+    "ac_eco": "0",
+    "ac_mode": "1",
+    "ac_fan": "3",
+    "ac_timer": "0",
+    "led_timer": "0"
+}
+
+is_backend_online = False
+
+def send_to_backend(path: str, timeout: float = 2.0) -> bytes:
+    """ Sends command to Local USB Serial if connected, else forwards to Room PC bridge """
+    global is_backend_online
+
+    # 1. Check if ESP32 is plugged directly into this server
+    if local_serial.connect():
+        is_backend_online = True
+        return execute_serial_for_path(path).encode("utf-8")
+
+    # If local USB port exists, avoid hanging for 2s on offline LAN bridge
+    if local_serial.find_port():
+        is_backend_online = False
+        raise ConnectionError("Local ESP32 USB port detected but failed to connect")
+
+    # 2. Otherwise route to Room PC Bridge over LAN
+    url = f"{ROOM_BRIDGE_URL}{path}"
+    try:
+        req = urllib.request.Request(url, headers={"Connection": "close"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+            is_backend_online = True
+            return data
+    except Exception as e:
+        is_backend_online = False
+        raise e
+
+def execute_serial_for_path(path: str) -> str:
+    """ Maps HTTP path to direct serial command when ESP32 is plugged locally """
+    parsed = urllib.parse.urlparse(path)
+    p = parsed.path
+    q = urllib.parse.parse_qs(parsed.query)
+
+    if p == "/status":
+        return local_serial.send_cmd("STATUS")
+    elif p == "/lamps/status":
+        return local_serial.send_cmd("LAMPS")
+    elif p == "/led/status":
+        return local_serial.send_cmd("LED")
+    elif p == "/targetTemperature":
+        val = q.get("value", ["24"])[0]
+        return local_serial.send_cmd(f"SET ac_temp {val}")
+    elif p == "/targetHeatingCoolingState":
+        val = q.get("value", ["0"])[0]
+        force = " 1" if q.get("force", ["0"])[0] == "1" else ""
+        return local_serial.send_cmd(f"SET ac_state {val}{force}")
+    elif p == "/ac/mode":
+        return local_serial.send_cmd("SET ac_mode")
+    elif p == "/ac/mode/status":
+        return local_serial.send_cmd("GET ac_mode")
+    elif p == "/ac/fan":
+        return local_serial.send_cmd("SET ac_fan")
+    elif p == "/ac/fan/status":
+        return local_serial.send_cmd("GET ac_fan")
+    elif p == "/ac/fan/speed":
+        val = q.get("value", ["33"])[0]
+        return local_serial.send_cmd(f"SET ac_fan_speed {val}")
+    elif p == "/ac/fan/active":
+        return "1"
+    elif p.startswith("/ac/swing"):
+        if p.endswith("/status"): return local_serial.send_cmd("GET ac_swing")
+        elif p.endswith("/on"): return local_serial.send_cmd("SET ac_swing 1")
+        elif p.endswith("/off"): return local_serial.send_cmd("SET ac_swing 0")
+        return local_serial.send_cmd("SET ac_swing")
+    elif p.startswith("/ac/eco"):
+        if p.endswith("/status"): return local_serial.send_cmd("GET ac_eco")
+        elif p.endswith("/on"): return local_serial.send_cmd("SET ac_eco 1")
+        elif p.endswith("/off"): return local_serial.send_cmd("SET ac_eco 0")
+        return local_serial.send_cmd("SET ac_eco")
+    elif p == "/ac/timer/status":
+        return local_serial.send_cmd("GET ac_timer")
+    elif p == "/ac/timer/on":
+        return local_serial.send_cmd("SET ac_timer_on")
+    elif p == "/ac/timer/off":
+        return local_serial.send_cmd("SET ac_timer_off")
+    elif p == "/ac/timer":
+        val = q.get("value", ["0"])[0]
+        return local_serial.send_cmd(f"SET ac_timer {val}")
+    elif p.startswith("/lamp/"):
+        parts = p.strip("/").split("/")
+        if len(parts) == 3:
+            name, act = parts[1], parts[2]
+            if act == "status": return local_serial.send_cmd(f"GET lamp {name}")
+            val = "1" if act == "on" else "0"
+            return local_serial.send_cmd(f"SET lamp {name} {val}")
+    elif p == "/led/on": return local_serial.send_cmd("SET led_power 1")
+    elif p == "/led/off": return local_serial.send_cmd("SET led_power 0")
+    elif p == "/led/hue":
+        val = q.get("value", ["0"])[0]
+        return local_serial.send_cmd(f"SET led_hue {val}")
+    elif p == "/led/saturation":
+        val = q.get("value", ["0"])[0]
+        return local_serial.send_cmd(f"SET led_sat {val}")
+    elif p == "/led/brightness":
+        val = q.get("value", ["100"])[0]
+        return local_serial.send_cmd(f"SET led_bri {val}")
+    elif p == "/led/mode": return local_serial.send_cmd("SET led_mode")
+    elif p == "/led/mode/status": return local_serial.send_cmd("GET led_mode")
+    elif p == "/led/speed": return local_serial.send_cmd("SET led_speed")
+    elif p == "/led/speed/status": return local_serial.send_cmd("GET led_speed")
+    elif p == "/led/timer/status": return local_serial.send_cmd("GET led_timer")
+    elif p == "/led/timer":
+        val = q.get("value", ["0"])[0]
+        return local_serial.send_cmd(f"SET led_timer {val}")
+    elif p == "/send_raw_power": return local_serial.send_cmd("SET ac_raw_power")
+    elif p == "/raw_temp_steps":
+        t = q.get("target", ["24"])[0]
+        return local_serial.send_cmd(f"SET ac_raw_temp_steps {t}")
+    elif p == "/set_state_raw":
+        s = q.get("state", ["0"])[0]
+        return local_serial.send_cmd(f"SET ac_state_raw {s}")
+    elif p == "/set_state_memory":
+        t, s = q.get("temp", ["24"])[0], q.get("state", ["0"])[0]
+        return local_serial.send_cmd(f"SET ac_state_mem {t} {s}")
+
+    return "OK"
+
+def background_poller():
+    global is_backend_online
+    last_err_time = 0
+    time.sleep(2.0)
+    while True:
+        try:
+            # Yield to active user commands
+            if time.time() - last_serial_cmd_time < 2.0:
+                time.sleep(1.0)
+                continue
+
+            if not is_calibrating:
+                # 1. Fetch /lamps/status
+                try:
+                    raw_lp = send_to_backend("/lamps/status", timeout=0.8).decode("utf-8")
+                    if raw_lp.startswith("{"):
+                        data = json.loads(raw_lp)
+                        for k, v in data.items():
+                            cache["lamps"][k] = bool(v)
+                except Exception:
+                    pass
+
+                # 2. Fetch /status (AC)
+                try:
+                    raw_st = send_to_backend("/status", timeout=0.8).decode("utf-8")
+                    if raw_st.startswith("{"):
+                        data = json.loads(raw_st)
+                        if virtual_state_override is None:
+                            cache["status"] = data
+                except Exception:
+                    pass
+
+                # 3. Fetch /led/status
+                try:
+                    raw_ld = send_to_backend("/led/status", timeout=0.8).decode("utf-8")
+                    if raw_ld.startswith("{"):
+                        cache["led"] = json.loads(raw_ld)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            now = time.time()
+            if now - last_err_time > 15:
+                print(f"[{format_ts()}] [WAITING] Poller: {e}")
+                last_err_time = now
+
+        time.sleep(3.0)
+
+threading.Thread(target=background_poller, daemon=True, name="Poller").start()
+
+# =========================================================================
+#  AC / FAN HARDWARE ACTION HELPERS
+# =========================================================================
+
+def set_ac_raw_state(state, retries=1):
+    try:
+        res = send_to_backend(f"/targetHeatingCoolingState?value={state}&force=1", timeout=2.0).decode("utf-8")
+        cache["status"]["targetHeatingCoolingState"] = int(state)
+        cache["status"]["currentHeatingCoolingState"] = int(state)
+        return res
+    except Exception as e:
+        print(f"[AC Proxy] Error setting raw AC state {state}: {e}")
+        return None
+
+def set_fan_raw_state(state, retries=1):
+    endpoint = "on" if state == 1 else "off"
+    try:
+        res = send_to_backend(f"/lamp/fan/{endpoint}", timeout=2.0).decode("utf-8")
+        cache["lamps"]["fan"] = (state == 1)
+        return res
+    except Exception as e:
+        print(f"[AC Proxy] Error setting fan state {state}: {e}")
+        return None
+
+def get_current_ac_state() -> bool:
+    global virtual_state_override
+    if virtual_state_override is not None:
+        return virtual_state_override != 0
+    return cache["status"].get("targetHeatingCoolingState", 0) != 0
+
+def get_current_fan_state() -> bool:
+    return cache["lamps"].get("fan", False)
+
+# =========================================================================
+#  AC / FAN ALTERNATE SWAP LOOP
+# =========================================================================
+
+def ac_fan_swap_loop(minutes):
+    global swap_active, swap_interval_minutes, virtual_state_override
+    print(f"[AC Proxy] Starting AC / Fan swap loop (Interval: {minutes} minutes)...")
+
+    ac_on = get_current_ac_state()
+    fan_on = get_current_fan_state()
+
+    if ac_on and not fan_on:
+        print(f"[AC Proxy] Smart Swap Start: AC is ON. Running {get_ac_phase_minutes():.0f} min AC phase.")
+        current_phase = "ac"
+    elif fan_on and not ac_on:
+        print(f"[AC Proxy] Smart Swap Start: Fan is ON. Running {swap_interval_minutes:.0f} min Fan phase.")
+        current_phase = "fan"
+    elif fan_on and ac_on:
+        print(f"[AC Proxy] Smart Swap Start: Both ON. Holding both for {get_ac_phase_minutes():.0f} min before phasing AC off.")
+        current_phase = "both"
+    else:
+        print("[AC Proxy] Smart Swap Start: Both OFF. Turning Fan ON and starting swap timer.")
+        current_phase = "fan"
+        set_fan_raw_state(1)
+        virtual_state_override = 0
+
+    last_phase_time = time.time()
+    while not swap_stop_event.is_set():
+        elapsed = time.time() - last_phase_time
+        phase_minutes = get_ac_phase_minutes() if current_phase in ("ac", "both") else swap_interval_minutes
+        target_seconds = phase_minutes * 60.0
+        remaining = target_seconds - elapsed
+
+        if remaining <= 0:
+            last_phase_time = time.time()
+            live_ac_on = get_current_ac_state()
+            live_fan_on = get_current_fan_state()
+
+            if current_phase == "both":
+                print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning AC OFF, Fan stays ON...")
+                current_phase = "fan"
+                set_ac_raw_state(0)
+                continue
+
+            if live_ac_on or current_phase == "ac":
+                print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning AC OFF, Fan ON (Phase: AC -> Fan)...")
+                ac_res = set_ac_raw_state(0)
+                if ac_res is None:
+                    print("[AC Proxy] WARNING: Failed to turn AC OFF during swap! Retrying in 10s...")
+                    last_phase_time = time.time() - (target_seconds - 10.0)
+                    continue
+                time.sleep(0.5)
+                fan_res = set_fan_raw_state(1)
+                if fan_res is None:
+                    print("[AC Proxy] WARNING: Failed to turn Fan ON during swap! Retrying in 10s...")
+                    last_phase_time = time.time() - (target_seconds - 10.0)
+                    continue
+                current_phase = "fan"
+            else:
+                print(f"[AC Proxy] Swap Interval reached ({phase_minutes}m): Turning Fan OFF, AC ON (Phase: Fan -> AC)...")
+                fan_res = set_fan_raw_state(0)
+                if fan_res is None:
+                    print("[AC Proxy] WARNING: Failed to turn Fan OFF during swap! Retrying in 10s...")
+                    last_phase_time = time.time() - (target_seconds - 10.0)
+                    continue
+                time.sleep(0.5)
+                ac_res = set_ac_raw_state(2)
+                if ac_res is None:
+                    print("[AC Proxy] WARNING: Failed to turn AC ON during swap! Retrying in 10s...")
+                    last_phase_time = time.time() - (target_seconds - 10.0)
+                    continue
+                current_phase = "ac"
+            continue
+
+        wait_slice = min(remaining, 1.0)
+        if swap_stop_event.wait(timeout=wait_slice):
+            break
+        if swap_update_event.is_set():
+            swap_update_event.clear()
+            print(f"[AC Proxy] Swap duration updated live -> now targeting {swap_interval_minutes} minute interval.")
+
+    print("[AC Proxy] AC / Fan swap loop stopped.")
+    swap_active = False
+
+def start_ac_fan_swap(minutes=None):
+    global swap_active, swap_thread, swap_stop_event, swap_update_event, swap_interval_minutes
+    if minutes is not None:
+        swap_interval_minutes = max(5.0, min(240.0, float(minutes)))
+    save_swap_state(True, swap_interval_minutes)
+    if swap_active:
+        print(f"[AC Proxy] Dynamic swap duration updated to {swap_interval_minutes} minutes.")
+        swap_update_event.set()
+        return
+    swap_stop_event.clear()
+    swap_update_event.clear()
+    swap_active = True
+    swap_thread = threading.Thread(target=ac_fan_swap_loop, args=(swap_interval_minutes,), daemon=True)
+    swap_thread.start()
+
+def stop_ac_fan_swap():
+    global swap_active, swap_stop_event, virtual_state_override
+    save_swap_state(False, swap_interval_minutes)
+    if swap_active:
+        print("[AC Proxy] Stopping AC / Fan swap loop...")
+        swap_active = False
+        swap_stop_event.set()
+        virtual_state_override = None
+
+def run_state_transition(val, target_temp, force=False):
+    global is_calibrating, virtual_state_override
+    with lock:
+        try:
+            t_val = int(float(target_temp))
+            if t_val < 16 or t_val > 30:
+                t_val = 24
+
+            if val != "0":
+                if not force and get_current_ac_state() and t_val == active_target_temp:
+                    print(f"[AC Proxy] Redundant ON command at {t_val}°C ignored.")
+                    return
+
+                print(f"[AC Proxy] Powering ON AC -> Setting target {t_val}°C...")
+                virtual_state_override = int(val)
+                set_ac_raw_state(val)
+                time.sleep(0.2)
+                send_to_backend(f"/targetTemperature?value={t_val}")
+                save_last_temp(t_val)
+                print(f"[AC Proxy] Power-on sequence complete at {t_val}°C.")
+            else:
+                print("[AC Proxy] Turning OFF AC...")
+                virtual_state_override = 0
+                set_ac_raw_state(0)
+        except Exception as e:
+            print(f"[AC Proxy] Error in state transition: {e}")
+        finally:
+            is_calibrating = False
+            if not swap_active:
+                virtual_state_override = None
+
+def run_hard_calibration(target_temp):
+    global is_calibrating
+    with lock:
+        try:
+            t_val = int(float(target_temp))
+            if t_val < 16 or t_val > 30:
+                t_val = 24
+            print(f"[AC Proxy] Safe Sync -> Setting AC to {t_val}°C...")
+            save_last_temp(t_val)
+            send_to_backend(f"/targetTemperature?value={t_val}")
+            print(f"[AC Proxy] Safe Sync Complete at {t_val}°C.")
+        except Exception as e:
+            print(f"[AC Proxy] Error during safe sync: {e}")
+        finally:
+            is_calibrating = False
+
+# =========================================================================
+#  HTTP REQUEST HANDLER (Homebridge REST API on :8880)
+# =========================================================================
+
 class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def do_POST(self):
+        self.do_GET()
+
     def do_GET(self):
-        global is_calibrating, active_target_temp, ESP32_IP, virtual_state_override, fan_speed_level
+        global is_calibrating, active_target_temp, virtual_state_override, fan_speed_level
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
         query = urllib.parse.parse_qs(parsed_url.query)
 
-        # Force virtual software state override without sending any IR signal
+        if not path.endswith("/status") and path != "/status" and path != "/download_bridge":
+            print(f"[{format_ts()}] [HTTP IN] {self.client_address[0]} -> {self.path}")
+
+        # Serve the Room PC bridge script directly
+        if path == "/download_bridge":
+            bridge_file = os.path.join(os.path.dirname(__file__), "room_pc", "esp_room_bridge.py")
+            if os.path.exists(bridge_file):
+                with open(bridge_file, "r") as f:
+                    content = f.read()
+                self.send_text(content)
+            else:
+                self.send_error(404, "Bridge script not found")
+            return
+
+        # 1. Virtual state override
         if path == "/set_virtual_state":
             st_param = query.get("state", [None])[0]
-            if st_param is not None:
-                virtual_state_override = int(st_param)
-            else:
-                virtual_state_override = None
+            virtual_state_override = int(st_param) if st_param is not None else None
             res_json = {
                 "targetTemperature": float(active_target_temp),
                 "currentTemperature": float(active_target_temp),
                 "targetHeatingCoolingState": virtual_state_override if virtual_state_override is not None else 0,
                 "currentHeatingCoolingState": virtual_state_override if virtual_state_override is not None else 0
             }
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(res_json).encode("utf-8"))
+            self.send_json(res_json)
             return
 
-        # Explicit sync endpoint to match system state with real life without firing IR
+        # 2. Sync state in software without firing IR
         if path == "/sync_ac":
             temp_param = query.get("temp", [None])[0]
             st_param = query.get("state", [None])[0]
             if temp_param is not None:
-                t_val = int(float(temp_param))
-                save_last_temp(t_val)
+                save_last_temp(int(float(temp_param)))
             if st_param is not None:
                 virtual_state_override = int(st_param)
-            # Invalidate cached status
-            _esp32_cache.pop("/status", None)
             res_json = {
                 "targetTemperature": float(active_target_temp),
                 "currentTemperature": float(active_target_temp),
                 "targetHeatingCoolingState": virtual_state_override if virtual_state_override is not None else 0,
                 "currentHeatingCoolingState": virtual_state_override if virtual_state_override is not None else 0
             }
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(res_json).encode("utf-8"))
+            self.send_json(res_json)
             return
 
-        # 1. Status: Sync in Real-Time
+        # 3. Thermostat status
         if path == "/status":
-            try:
-                if is_calibrating:
-                    # Return target temp and COOL state consistently during calibration so HomeKit UI does not flicker or gray out
-                    res_json = {
-                        "targetTemperature": float(active_target_temp),
-                        "currentTemperature": float(active_target_temp),
-                        "targetHeatingCoolingState": 2,
-                        "currentHeatingCoolingState": 2
-                    }
-                    data = json.dumps(res_json).encode("utf-8")
-                elif virtual_state_override is not None:
-                    res_json = {
-                        "targetTemperature": float(active_target_temp),
-                        "currentTemperature": float(active_target_temp),
-                        "targetHeatingCoolingState": virtual_state_override,
-                        "currentHeatingCoolingState": virtual_state_override
-                    }
-                    data = json.dumps(res_json).encode("utf-8")
-                else:
-                    data = fetch_esp32("/status")
-
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            except Exception as e:
-                cached = _esp32_cache.get("/status")
-                if cached:
-                    try:
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(cached[1])
-                    except Exception:
-                        pass
-                    return
+            if is_calibrating:
                 res_json = {
+                    "targetTemperature": float(active_target_temp),
+                    "currentTemperature": float(active_target_temp),
+                    "targetHeatingCoolingState": 2,
+                    "currentHeatingCoolingState": 2
+                }
+            elif virtual_state_override is not None:
+                res_json = {
+                    "targetTemperature": float(active_target_temp),
+                    "currentTemperature": float(active_target_temp),
+                    "targetHeatingCoolingState": virtual_state_override,
+                    "currentHeatingCoolingState": virtual_state_override
+                }
+            else:
+                res_json = cache.get("status", {
                     "targetTemperature": float(active_target_temp),
                     "currentTemperature": float(active_target_temp),
                     "targetHeatingCoolingState": 0,
                     "currentHeatingCoolingState": 0
-                }
-                try:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps(res_json).encode("utf-8"))
-                except Exception:
-                    pass
+                })
+            self.send_json(res_json)
+            return
 
-        # 2. Intercept targetHeatingCoolingState (Power On/Off with Auto-Sync to Last Degree)
-        elif path == "/targetHeatingCoolingState":
+        # 4. Target Heating / Cooling State
+        if path == "/targetHeatingCoolingState":
             val = query.get("value", ["0"])[0]
             target = query.get("target", [str(active_target_temp)])[0]
             raw = query.get("raw", ["0"])[0]
@@ -631,34 +721,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 t_val = active_target_temp
             save_last_temp(t_val)
-            
-            # Auto-stop swap loop if the user manually turns the AC OFF while a swap is running --
-            # the swap no longer owns AC/Fan state at that point, so it must not keep alternating
-            # them behind the user's back.
-            # Guard on get_current_ac_state() so this only fires on a genuine on->off
-            # transition. During the swap's "fan" phase the AC is already forced off, and
-            # HA periodically re-affirms that state by resending value=0 (same redundant-sync
-            # quirk documented on the ESP32 side) -- without this check that resend would
-            # silently kill the swap loop, leaving swap_active False so a later duration
-            # change restarts from scratch instead of extending the running phase.
-            if str(val) == "0" and swap_active and get_current_ac_state():
-                # Only stop swap if this was an intentional user action, not a background raw script
-                if raw != "1":
-                    print("[AC Proxy] Manual AC OFF received -> stopping AC/Fan swap loop.")
-                    stop_ac_fan_swap()
+
+            if str(val) == "0" and swap_active and get_current_ac_state() and raw != "1":
+                print("[AC Proxy] Manual AC OFF received -> stopping AC/Fan swap loop.")
+                stop_ac_fan_swap()
 
             if str(val) != "0" and raw == "1":
-                print(f"[AC Proxy] Powering ON AC without calibration (raw power toggle)...")
-                threading.Thread(target=set_ac_raw_state, args=(val, 3), daemon=True).start()
+                threading.Thread(target=set_ac_raw_state, args=(val,), daemon=True).start()
             else:
                 threading.Thread(target=run_state_transition, args=(val, t_val), daemon=True).start()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
 
-        # 3. Hard Calibration (Ceiling + Floor + Target sync)
-        elif path == "/calibrate":
+            self.send_text("OK")
+            return
+
+        # 5. Target Temperature
+        if path == "/targetTemperature":
+            val = query.get("value", ["24"])[0]
+            save_last_temp(val)
+            if not is_calibrating:
+                try:
+                    send_to_backend(f"/targetTemperature?value={val}")
+                    cache["status"]["targetTemperature"] = float(val)
+                    cache["status"]["currentTemperature"] = float(val)
+                except Exception as e:
+                    print(f"[AC Proxy] Error setting target temp: {e}")
+            self.send_text("OK")
+            return
+
+        # 6. Hard Calibration
+        if path == "/calibrate":
             target = query.get("target", [str(active_target_temp)])[0]
             try:
                 t_val = int(float(target))
@@ -666,42 +757,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 t_val = active_target_temp
             save_last_temp(t_val)
             threading.Thread(target=run_hard_calibration, args=(t_val,), daemon=True).start()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
+            self.send_text("OK")
+            return
 
-        # 4. AC / Fan Alternate Swap Control
-        elif path == "/ac_fan_swap/on":
-            # No "minutes" param -> keep whatever duration is already set (last used,
-            # or whatever the Duration slider set) instead of resetting it to 30.
+        # 7. AC / Fan Swap Controls
+        if path == "/ac_fan_swap/on":
             minutes_param = query.get("minutes", [None])[0]
             start_ac_fan_swap(float(minutes_param) if minutes_param is not None else None)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"1")
+            self.send_text("1")
+            return
 
-        elif path == "/ac_fan_swap/off":
+        # 7. AC / Fan Swap Controls
+        if path == "/ac_fan_swap/on":
+            minutes_param = query.get("minutes", [None])[0]
+            start_ac_fan_swap(float(minutes_param) if minutes_param is not None else None)
+            self.send_text("1")
+            return
+
+        if path == "/ac_fan_swap/off":
             stop_ac_fan_swap()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"0")
+            self.send_text("0")
+            return
 
-        elif path == "/ac_fan_swap/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"1" if swap_active else b"0")
+        if path == "/ac_fan_swap/status":
+            self.send_text("1" if swap_active else "0")
+            return
 
-        # AC / Fan Swap Duration control (0-100% mapped to 5-240 minutes of FAN-ON time,
-        # 5-minute steps; the AC-ON phase scales off this via get_ac_phase_minutes()
-        # (1/6 of it, clamped 15-45 min), it isn't set directly by this slider).
-        # Setting it live-updates the running swap loop's Fan interval; setting
-        # it to 0 stops the swap, mirroring the existing AC Shutoff Timer / LED Sleep
-        # Timer pattern.
-        elif path == "/ac_fan_swap/duration":
+        if path == "/ac_fan_swap/duration":
             val = query.get("value", [None])[0]
             if val is not None:
                 pct = max(0.0, min(100.0, float(val)))
@@ -711,75 +793,113 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     minutes = max(5.0, round((pct * 240.0 / 100.0) / 5.0) * 5.0)
                     start_ac_fan_swap(minutes)
             pct_response = int(min(100.0, (swap_interval_minutes / 240.0) * 100.0))
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(str(pct_response).encode())
+            self.send_text(str(pct_response))
+            return
 
-        elif path == "/ac_fan_swap/duration/status":
+        if path == "/ac_fan_swap/duration/status":
             pct_response = int(min(100.0, (swap_interval_minutes / 240.0) * 100.0))
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(str(pct_response).encode())
+            self.send_text(str(pct_response))
+            return
 
-        # Route the Fan (lamp/fan) power endpoints through the proxy so that turning
-        # the Fan off manually can also opt the swap out, the same way the AC does.
-        elif path in ("/lamp/fan/on", "/lamp/fan/off"):
-            # Only stop the swap if the Fan was actually ON before this "off" arrived.
-            # Check cached state directly to avoid blocking network I/O before command execution!
-            fan_was_on = False
-            cached_fan = _esp32_cache.get("/lamp/fan/status")
-            if cached_fan:
-                fan_was_on = cached_fan[1] == b"1" or cached_fan[1].lower() == b"true"
-            else:
-                fan_was_on = True # default assume on if unknown
+        # 8. Lamps Status & Actions (Instant response + Sync)
+        if path == "/lamps/status":
+            self.send_json(cache.get("lamps", {"main": False, "fairy": False, "fan": False, "backlight": False}))
+            return
 
-            if path == "/lamp/fan/off" and swap_active and fan_was_on:
-                print("[AC Proxy] Fan manually turned OFF while swap active -> stopping swap.")
-                stop_ac_fan_swap()
-            try:
-                data = send_esp32_cmd(path, timeout=2.0, retries=1)
-                # Optimistically update fan status cache
-                _esp32_cache["/lamp/fan/status"] = (time.time(), b"1" if path == "/lamp/fan/on" else b"0")
-                _esp32_cache.pop("/lamps/status", None)
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(data)
-            except Exception as e:
-                self.send_error(500, str(e))
+        if path.startswith("/lamp/") and path.endswith("/status"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 3:
+                lamp_name = parts[1]
+                is_on = cache.get("lamps", {}).get(lamp_name, False)
+                self.send_text("1" if is_on else "0")
+                return
 
-        # 5. TargetTemperature: Save on change and forward directly
-        elif path == "/targetTemperature":
-            val = query.get("value", ["24"])[0]
-            save_last_temp(val)
-            if is_calibrating:
-                # Ignore target temperature changes during calibration to prevent interrupting calibration algorithm
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"OK")
-            else:
+        if path.startswith("/lamp/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[2] in ("on", "off"):
+                lamp_name, act = parts[1], parts[2]
+                turn_on = (act == "on")
+                cache["lamps"][lamp_name] = turn_on
+                if lamp_name == "fan" and not turn_on and swap_active:
+                    print("[AC Proxy] Fan manually turned OFF while swap active -> stopping swap.")
+                    stop_ac_fan_swap()
                 try:
-                    data = send_esp32_cmd(f"/targetTemperature?value={val}", timeout=2.0, retries=1)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(data)
+                    res = send_to_backend(self.path).decode("utf-8")
+                    print(f"[{format_ts()}] [LAMP] {lamp_name} -> {act} | serial response: {res.strip()}")
                 except Exception as e:
-                    self.send_error(500, str(e))
+                    print(f"[AC Proxy] Error executing {path}: {e}")
+                self.send_text("1" if turn_on else "0")
+                return
 
-        # 6. AC Fan Speed: report our own cache to HomeKit/HA instead of the ESP32's
-        # fan_speed_level (which has no real feedback from the AC and boots believing
-        # Low), while still forwarding real changes to the ESP32 so the AC itself moves.
-        elif path == "/ac/fan/speed/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(str(fan_speed_level * 33).encode())
+        # 9. LED Status & Actions
+        if path == "/led/status":
+            self.send_json(cache.get("led", {}))
+            return
 
-        elif path == "/ac/fan/speed":
+        if path == "/led/timer/status":
+            self.send_text(str(cache.get("led_timer", "0")))
+            return
+
+        if path == "/led/mode/status":
+            self.send_text(str(cache.get("led", {}).get("mode", 1)))
+            return
+
+        if path == "/led/speed/status":
+            self.send_text(str(cache.get("led", {}).get("speed", 1)))
+            return
+
+        if path == "/led/on":
+            cache["led"]["power"] = True
+            threading.Thread(target=lambda: send_to_backend("/led/on"), daemon=True).start()
+            self.send_text("1")
+            return
+
+        if path == "/led/off":
+            cache["led"]["power"] = False
+            threading.Thread(target=lambda: send_to_backend("/led/off"), daemon=True).start()
+            self.send_text("0")
+            return
+
+        if path == "/led/brightness":
+            val = query.get("value", ["100"])[0]
+            try:
+                cache["led"]["brightness"] = int(float(val))
+            except Exception:
+                pass
+            threading.Thread(target=lambda: send_to_backend(f"/led/brightness?value={val}"), daemon=True).start()
+            self.send_text(val)
+            return
+
+        if path == "/led/hue":
+            val = query.get("value", ["0"])[0]
+            try:
+                cache["led"]["hue"] = int(float(val))
+            except Exception:
+                pass
+            threading.Thread(target=lambda: send_to_backend(f"/led/hue?value={val}"), daemon=True).start()
+            self.send_text(val)
+            return
+
+        if path == "/led/saturation":
+            val = query.get("value", ["0"])[0]
+            try:
+                cache["led"]["saturation"] = int(float(val))
+            except Exception:
+                pass
+            threading.Thread(target=lambda: send_to_backend(f"/led/saturation?value={val}"), daemon=True).start()
+            self.send_text(val)
+            return
+
+        # 10. AC Fan & Modes status
+        if path == "/ac/fan/speed/status":
+            self.send_text(str(fan_speed_level * 33))
+            return
+
+        if path == "/ac/fan/status":
+            self.send_text(str(fan_speed_level))
+            return
+
+        if path == "/ac/fan/speed":
             val = query.get("value", [None])[0]
             if val is not None:
                 try:
@@ -787,251 +907,106 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pct = fan_speed_level * 33
                 target_level = 1
-                if pct > 33 and pct <= 66:
-                    target_level = 2
-                elif pct > 66:
+                if pct > 66:
                     target_level = 3
+                elif pct > 33:
+                    target_level = 2
                 save_fan_level(target_level)
-                try:
-                    send_esp32_cmd(f"/ac/fan/speed?value={val}", timeout=2.0, retries=1)
-                except Exception as e:
-                    print(f"[AC Proxy] Error forwarding fan speed set: {e}")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(str(fan_speed_level * 33).encode())
+                threading.Thread(target=lambda: send_to_backend(f"/ac/fan/speed?value={val}"), daemon=True).start()
+            self.send_text(str(fan_speed_level * 33))
+            return
 
-        # Physical FAN button cycle: forward the real IR press to the ESP32, then mirror
-        # its resulting level back into our cache so /ac/fan/speed/status stays in sync.
-        elif path == "/ac/fan":
+        if path == "/ac/fan":
             try:
-                data = send_esp32_cmd("/ac/fan", timeout=2.0, retries=1)
+                res = send_to_backend("/ac/fan").decode("utf-8")
                 try:
-                    save_fan_level(int(data.decode().strip()))
+                    save_fan_level(int(res.strip()))
                 except Exception:
                     pass
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(str(fan_speed_level).encode())
+                self.send_text(str(fan_speed_level))
             except Exception as e:
                 self.send_error(500, str(e))
+            return
 
-        # Homebridge HTTP-FAN-V2 active status / validation endpoint. Always respond 1
-        # directly from proxy without touching ESP32 or acquiring hardware locks.
-        elif path == "/ac/fan/active":
+        if path == "/ac/fan/active":
+            self.send_text("1")
+            return
+
+        if path == "/ac/swing/status":
+            self.send_text(str(cache.get("ac_swing", "0")))
+            return
+
+        if path == "/ac/eco/status":
+            self.send_text(str(cache.get("ac_eco", "0")))
+            return
+
+        if path == "/ac/mode/status":
+            self.send_text(str(cache.get("ac_mode", "1")))
+            return
+
+        if path == "/ac/timer/status":
+            self.send_text(str(cache.get("ac_timer", "0")))
+            return
+
+        # 11. Fallback for any other route
+        base_clean = path.split("?", 1)[0]
+        if base_clean.endswith("/status"):
+            self.send_text("0")
+            return
+
+        try:
+            res = send_to_backend(self.path).decode("utf-8")
+            self.send_text(res)
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def send_text(self, text: str):
+        try:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"1")
+            self.wfile.write(str(text).encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-        else:
-            try:
-                # Only cache/dedupe true status reads. Everything else falling through
-                # to here is a one-shot action (e.g. /lamp/main/on, /ac/swing,
-                # /ac/timer/on)
-                base_clean = self.path.split("?", 1)[0]
-                if base_clean.endswith("/status") or base_clean == "/lamps/status":
-                    data = fetch_esp32(self.path)
-                else:
-                    data = send_esp32_cmd(self.path, timeout=2.0, retries=1)
-                    # Optimistically update cache and invalidate stale keys
-                    base = self.path.split("?", 1)[0]
-                    _esp32_cache.pop(base, None)
-                    _esp32_cache.pop(base + "/status", None)
-                    
-                    # For lamp endpoints like /lamp/main/on or /lamp/fairy/off
-                    if base.startswith("/lamp/") and (base.endswith("/on") or base.endswith("/off")):
-                        lamp_name = base.split("/")[2]
-                        new_state = b"1" if base.endswith("/on") else b"0"
-                        _esp32_cache[f"/lamp/{lamp_name}/status"] = (time.time(), new_state)
-                    elif base.startswith("/led/") and (base.endswith("/on") or base.endswith("/off")):
-                        new_state = b"1" if base.endswith("/on") else b"0"
-                        _esp32_cache["/led/status"] = (time.time(), new_state)
-
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            except Exception as e:
-                base_clean = self.path.split("?", 1)[0]
-                if base_clean.endswith("/status") or base_clean == "/lamps/status":
-                    cached = _esp32_cache.get(self.path)
-                    if cached:
-                        try:
-                            self.send_response(200)
-                            self.send_header("Content-Type", "text/plain")
-                            self.end_headers()
-                            self.wfile.write(cached[1])
-                            return
-                        except Exception:
-                            return
-                    else:
-                        try:
-                            self.send_response(200)
-                            self.send_header("Content-Type", "text/plain")
-                            self.end_headers()
-                            fallback = b'{"main":false,"fairy":false,"fan":false,"backlight":false}' if base_clean == "/lamps/status" else b"0"
-                            self.wfile.write(fallback)
-                            return
-                        except Exception:
-                            return
-                self.send_error(500, str(e))
-
-def run_state_transition(val, target_temp, force=False):
-    global is_calibrating, ESP32_IP, virtual_state_override
-    with lock:
+    def send_json(self, data: Any):
         try:
-            t_val = int(float(target_temp))
-            if t_val < 16 or t_val > 30:
-                t_val = 24
-
-            if val != "0":
-                # If AC is already on and target temperature is the same, do nothing
-                if not force and get_current_ac_state() and t_val == active_target_temp:
-                    print(f"[AC Proxy] Redundant ON command at {t_val}°C ignored (AC already ON at that target).")
-                    return
-
-                print(f"[AC Proxy] Powering ON AC -> Setting target {t_val}°C...")
-                virtual_state_override = int(val)
-                # Send power toggle to ESP32
-                set_ac_raw_state(val, retries=1)
-                time.sleep(0.3)
-                # Send target temperature directly without sweeping to 31 or 16
-                send_esp32_cmd(f"/targetTemperature?value={t_val}", timeout=2.0, retries=1)
-                save_last_temp(t_val)
-                print(f"[AC Proxy] Power-on sequence complete at {t_val}°C.")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if isinstance(data, (dict, list)):
+                self.wfile.write(json.dumps(data, separators=(',', ':')).encode("utf-8"))
             else:
-                print("[AC Proxy] Turning OFF AC...")
-                virtual_state_override = 0
-                set_ac_raw_state(0, retries=1)
-        except Exception as e:
-            print(f"[AC Proxy] Error in state transition: {e}")
-        finally:
-            is_calibrating = False
-            if not swap_active:
-                virtual_state_override = None
+                self.wfile.write(str(data).encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-def run_hard_calibration(target_temp):
-    """ SAFE calibration: Syncs state in software and sends clean target temp without dangerous floor/ceiling swings """
-    global is_calibrating, ESP32_IP
-    with lock:
-        try:
-            t_val = int(float(target_temp))
-            if t_val < 16 or t_val > 30:
-                t_val = 24
-            print(f"[AC Proxy] Safe Sync -> Setting AC to {t_val}°C without floor/ceiling sweeping...")
-            save_last_temp(t_val)
-            # Sync directly to target
-            send_esp32_cmd(f"/targetTemperature?value={t_val}", timeout=2.0, retries=1)
-            print(f"[AC Proxy] Safe Sync Complete at {t_val}°C.")
-        except Exception as e:
-            print(f"[AC Proxy] Error during safe sync: {e}")
-        finally:
-            is_calibrating = False
-
-def esp32_background_poller():
-    consecutive_failures = 0
-    while True:
-        try:
-            if is_calibrating:
-                time.sleep(2.0)
-                continue
-
-            # 1. Bulk Poll /lamps/status (updates main, fairy, fan, backlight simultaneously)
-            if esp32_io_lock.acquire(blocking=False):
-                try:
-                    url = f"http://{ESP32_IP}/lamps/status"
-                    req = urllib.request.Request(url, headers={"Connection": "close"})
-                    with urllib.request.urlopen(req, timeout=2.5) as r:
-                        raw = r.read()
-                    data = json.loads(raw.decode("utf-8"))
-                    t = time.time()
-                    _esp32_cache["/lamps/status"] = (t, raw)
-                    if "main" in data:
-                        _esp32_cache["/lamp/main/status"] = (t, b"1" if data["main"] else b"0")
-                    if "fairy" in data:
-                        _esp32_cache["/lamp/fairy/status"] = (t, b"1" if data["fairy"] else b"0")
-                    if "fan" in data:
-                        _esp32_cache["/lamp/fan/status"] = (t, b"1" if data["fan"] else b"0")
-                    if "backlight" in data:
-                        _esp32_cache["/lamp/backlight/status"] = (t, b"1" if data["backlight"] else b"0")
-                    consecutive_failures = 0
-                except Exception:
-                    consecutive_failures += 1
-                finally:
-                    esp32_io_lock.release()
-
-            time.sleep(2.0)
-
-            # 2. Poll /status (AC Thermostat)
-            if not is_calibrating and esp32_io_lock.acquire(blocking=False):
-                try:
-                    url = f"http://{ESP32_IP}/status"
-                    req = urllib.request.Request(url, headers={"Connection": "close"})
-                    with urllib.request.urlopen(req, timeout=2.5) as r:
-                        raw = r.read()
-                    _esp32_cache["/status"] = (time.time(), raw)
-                    consecutive_failures = 0
-                except Exception:
-                    consecutive_failures += 1
-                finally:
-                    esp32_io_lock.release()
-
-            time.sleep(2.0)
-
-            # 3. Poll /led/status
-            if not is_calibrating and esp32_io_lock.acquire(blocking=False):
-                try:
-                    url = f"http://{ESP32_IP}/led/status"
-                    req = urllib.request.Request(url, headers={"Connection": "close"})
-                    with urllib.request.urlopen(req, timeout=2.5) as r:
-                        raw = r.read()
-                    _esp32_cache["/led/status"] = (time.time(), raw)
-                    consecutive_failures = 0
-                except Exception:
-                    consecutive_failures += 1
-                finally:
-                    esp32_io_lock.release()
-
-            if consecutive_failures >= 15:
-                discover_esp32()
-                consecutive_failures = 0
-
-            time.sleep(2.0)
-        except Exception:
-            time.sleep(2.0)
+# =========================================================================
+#  MAIN ENTRY POINT
+# =========================================================================
 
 def main():
-    print(f"Starting AC Proxy Server on port {PORT}...")
-    threading.Thread(target=esp32_background_poller, daemon=True).start()
+    print(f"\n=======================================================")
+    print(f"  AC Proxy - Central Server Bridge                     ")
+    print(f"  Listening on: http://127.0.0.1:{PORT}               ")
+    print(f"  Target Room Bridge: {ROOM_BRIDGE_URL}               ")
+    print(f"=======================================================\n")
 
-    # Auto-resume swap loop in background once ESP32 is confirmed reachable
+    # Auto-resume swap loop in background once backend is detected
     def auto_resume_swap():
         if load_swap_state():
-            print(f"[AC Proxy] Waiting for ESP32 ({ESP32_IP}) before restoring swap loop...")
+            print("[AC Proxy] Waiting for Room PC backend before restoring swap loop...")
             start_wait = time.time()
-            connected = False
-            while time.time() - start_wait < 60:
-                try:
-                    with urllib.request.urlopen(f"http://{ESP32_IP}/status", timeout=2.0) as r:
-                        if r.status == 200:
-                            connected = True
-                            break
-                except Exception:
-                    time.sleep(2.0)
-            if connected:
-                time.sleep(2.0)  # Allow poller to warm cache
+            while time.time() - start_wait < 60 and not is_backend_online:
+                time.sleep(2.0)
+            if is_backend_online:
+                time.sleep(1.0)
                 print(f"[AC Proxy] Restoring previously active AC / Fan swap loop ({swap_interval_minutes}m)...")
                 start_ac_fan_swap(swap_interval_minutes)
-            else:
-                print("[AC Proxy] Warning: ESP32 not reachable after 60s at startup; swap auto-resume deferred.")
 
     threading.Thread(target=auto_resume_swap, daemon=True).start()
 
-    server = ThreadingHTTPServer(("", PORT), ProxyHandler)  # bind all interfaces
+    server = ThreadingHTTPServer(("", PORT), ProxyHandler)
     server.serve_forever()
 
 if __name__ == "__main__":
