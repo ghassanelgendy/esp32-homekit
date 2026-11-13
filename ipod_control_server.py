@@ -246,6 +246,94 @@ def play_by_playlist(pl_name):
     except Exception, e:
         return False, str(e)
 
+# ---------------------------------------------------------------------------
+# Telegram/file stream queue: plays MP3s from AUDIO_DIR (or http URLs) with
+# AVPlayer, bypassing the media library. HA's /play /pause /next /prev /status
+# act on this queue while url_mode is True.
+# ---------------------------------------------------------------------------
+AUDIO_DIR = '/var/mobile/Media/TelegramAudio'
+av_player = None
+url_mode = False
+url_queue = []          # list of dicts: title, loc, dur
+url_index = 0
+url_paused = False
+url_elapsed = 0.0
+url_last_tick = 0.0
+
+def _loc_to_url(loc):
+    if loc.startswith('http://') or loc.startswith('https://') or loc.startswith('file://'):
+        return loc
+    return 'file://' + AUDIO_DIR + '/' + urllib.quote(loc)
+
+def _av_start(index):
+    global av_player, url_index, url_paused, url_elapsed, url_last_tick
+    url_index = index % len(url_queue)
+    item = url_queue[url_index]
+    nsurl = msg(objc.objc_getClass('NSURL'), 'URLWithString:', to_ns(_loc_to_url(item['loc'])), argtypes=[ctypes.c_void_p])
+    if not nsurl:
+        return False
+    if av_player:
+        msg(av_player, 'pause')
+        msg(av_player, 'release')
+    av_player = msg(msg(objc.objc_getClass('AVPlayer'), 'alloc'), 'initWithURL:', nsurl, argtypes=[ctypes.c_void_p])
+    msg(av_player, 'play')
+    url_paused = False
+    url_elapsed = 0.0
+    url_last_tick = time.time()
+    pump_runloop(0.3)
+    return True
+
+def play_queue(items, start=0):
+    """items: list of [title, location, duration_seconds]"""
+    global url_mode, url_queue, user_paused
+    try:
+        url_queue = [{'title': i[0], 'loc': i[1], 'dur': float(i[2]) if len(i) > 2 else 0.0} for i in items]
+        if not url_queue:
+            return False, "Empty queue"
+        user_paused = True          # keep the library keep-alive quiet
+        msg(player, 'pause')
+        url_mode = True
+        _av_start(start)
+        return True, "Playing %d tracks" % len(url_queue)
+    except Exception, e:
+        return False, str(e)
+
+def url_control(path):
+    global url_paused, url_last_tick
+    if path == '/pause' or (path == '/toggle' and not url_paused):
+        msg(av_player, 'pause'); url_paused = True
+        return 'paused'
+    if path == '/play' or path == '/toggle':
+        msg(av_player, 'play'); url_paused = False; url_last_tick = time.time()
+        return 'playing'
+    if path == '/next':
+        _av_start(url_index + 1); return 'next'
+    if path == '/prev':
+        _av_start(url_index - 1); return 'prev'
+    return 'noop'
+
+def url_tick():
+    """Called from the main loop: advance when the current track has finished."""
+    global url_elapsed, url_last_tick
+    if not url_mode or not av_player or url_paused:
+        url_last_tick = time.time()
+        return
+    now = time.time()
+    url_elapsed += now - url_last_tick
+    url_last_tick = now
+    dur = url_queue[url_index]['dur']
+    if dur and url_elapsed > dur + 2:
+        _av_start(url_index + 1)
+
+def stop_queue():
+    global av_player, url_mode, user_paused
+    if av_player:
+        msg(av_player, 'pause')
+        msg(av_player, 'release')
+        av_player = None
+    url_mode = False
+    user_paused = False
+
 def play_by_track_id(track_id):
     global user_paused
     try:
@@ -461,6 +549,28 @@ print "SUCCESS"
                 out, err = p.communicate()
 
                 self.send_json_str('{"status": "ok", "message": "Uploaded %s successfully"}' % json_escape(clean_title))
+            elif path == '/put':
+                name = os.path.basename(urllib.unquote(cgi.parse_qs(parsed.query).get('name', [''])[0]))
+                if not name or not name.lower().endswith(('.mp3', '.m4a')):
+                    self.send_json_str('{"status": "error", "message": "bad name"}', 400)
+                    return
+                if not os.path.exists(AUDIO_DIR):
+                    os.makedirs(AUDIO_DIR)
+                    os.chmod(AUDIO_DIR, 0777)
+                remaining = int(self.headers.getheader('content-length', 0))
+                dest = os.path.join(AUDIO_DIR, name)
+                f = open(dest, 'wb')
+                try:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                finally:
+                    f.close()
+                os.chmod(dest, 0666)
+                self.send_json_str('{"status": "ok", "message": "saved %s"}' % json_escape(name))
             else:
                 self.send_json_str('{"error": "not found"}', 404)
         except Exception, e:
@@ -480,7 +590,16 @@ print "SUCCESS"
             path = parsed.path
             query = cgi.parse_qs(parsed.query) if parsed.query else {}
 
-            if path == '/play':
+            if url_mode and path in ('/play', '/pause', '/toggle', '/next', '/prev'):
+                self.send_json_str('{"status": "ok", "action": "%s"}' % url_control(path))
+
+            elif url_mode and (path == '/status' or path == '/'):
+                cur = url_queue[url_index]
+                self.send_json_str('{"state": "%s", "title": "%s", "artist": "Telegram", "album": "%d/%d", "volume": %d, "current_track_id": "q%d", "playlist": "Telegram"}' % (
+                    'paused' if url_paused else 'playing', json_escape(cur['title']),
+                    url_index + 1, len(url_queue), get_volume(), url_index))
+
+            elif path == '/play':
                 user_paused = False
                 ensure_queue()
                 msg(player, 'play')
@@ -563,6 +682,24 @@ print "SUCCESS"
                 self.send_json_str('{"status": "%s", "message": "%s"}' % (
                     "ok" if ok else "error", json_escape(message)
                 ))
+
+            elif path == '/play_queue':
+                try:
+                    # q = "title,location,seconds;title,location,seconds" with each field percent-encoded
+                    items = []
+                    for rec in query.get('q', [''])[0].split(';'):
+                        if rec:
+                            items.append([urllib.unquote(x) for x in rec.split(',')])
+                    start_i = int(query.get('start', ['0'])[0])
+                    ok, message = play_queue(items, start_i)
+                except Exception, e:
+                    ok, message = False, str(e)
+                self.send_json_str('{"status": "%s", "message": "%s"}' % (
+                    "ok" if ok else "error", json_escape(message)))
+
+            elif path == '/stop_queue':
+                stop_queue()
+                self.send_json_str('{"status": "ok", "action": "stop_queue"}')
 
             elif path == '/play_track':
                 track_id = query.get('id', [''])[0]
@@ -649,7 +786,9 @@ def run_server():
         try:
             route_watchdog()
             pump_runloop(0.1)
-            if not user_paused:
+            if url_mode:
+                url_tick()
+            elif not user_paused:
                 state_code = msg(player, 'playbackState', restype=ctypes.c_long)
                 if state_code != 1:
                     ensure_queue()
