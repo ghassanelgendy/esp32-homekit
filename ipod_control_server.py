@@ -453,7 +453,8 @@ conn.commit()
 conn.close()
 print "SUCCESS"
 """
-                args = ["/usr/bin/python", "-c", code, clean_title.encode('utf-8'), disk_filename, str(len(file_bytes))]
+                title_bytes = clean_title.encode('utf-8') if isinstance(clean_title, unicode) else clean_title
+                args = ["/usr/bin/python", "-c", code, title_bytes, disk_filename, str(len(file_bytes))]
                 if pl_item:
                     args.append(pl_item)
                 p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
