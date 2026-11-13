@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>iPhone 4S Player Controls</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #14161c;
+    color: #e0e0e0;
+  }
+  .card-container {
+    max-width: 500px;
+    margin: 0 auto;
+    background: rgba(30, 32, 38, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 16px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .header-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .badge {
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 3px 8px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.1);
+    color: #a0a0a0;
+    text-transform: uppercase;
+  }
+  .badge.playing { background: rgba(48, 209, 88, 0.2); color: #30d158; }
+  .badge.paused { background: rgba(255, 159, 10, 0.2); color: #ff9f0a; }
+
+  .track-info {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 10px;
+    margin-bottom: 14px;
+  }
+  .track-title {
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: #ffffff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .track-meta {
+    font-size: 0.78rem;
+    color: #8e8e93;
+    margin-top: 3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .section-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #8e8e93;
+    margin-bottom: 6px;
+    display: block;
+  }
+  select, input {
+    width: 100%;
+    background: #14161c;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: #ffffff;
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 0.88rem;
+    outline: none;
+  }
+  select:focus, input:focus { border-color: #0a84ff; }
+
+  .btn-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  button {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #ffffff;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.86rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  button:hover { background: rgba(255, 255, 255, 0.15); }
+  button:active { transform: scale(0.98); }
+  .btn-primary { background: #0a84ff; border-color: #0a84ff; }
+  .btn-primary:hover { background: #0071e3; }
+  .btn-success { background: rgba(48, 209, 88, 0.15); border-color: rgba(48, 209, 88, 0.3); color: #30d158; }
+  .btn-danger { background: rgba(255, 69, 58, 0.15); border-color: rgba(255, 69, 58, 0.3); color: #ff453a; }
+  .btn-purple { background: rgba(88, 86, 214, 0.2); border-color: rgba(88, 86, 214, 0.4); color: #af52de; }
+  .btn-purple:hover { background: rgba(88, 86, 214, 0.35); }
+
+  .message-toast {
+    min-height: 20px;
+    margin-top: 10px;
+    font-size: 0.82rem;
+    text-align: center;
+    color: #ffd60a;
+  }
+</style>
+</head>
+<body>
+
+<div class="card-container">
+  <div class="header">
+    <div class="header-title">
+      <span>📻 iPhone 4S Music Manager</span>
+    </div>
+    <span id="state-badge" class="badge">...</span>
+  </div>
+
+  <div class="track-info">
+    <div id="now-title" class="track-title">Loading player status...</div>
+    <div id="now-meta" class="track-meta"></div>
+  </div>
+
+  <!-- PLAYLIST -->
+  <div style="margin-bottom: 12px;">
+    <label class="section-label">Select Playlist</label>
+    <div style="display: flex; gap: 8px;">
+      <select id="pl-select" style="flex: 1;"></select>
+      <button id="btn-play-pl" class="btn-primary" style="padding: 0 16px;">▶ Play</button>
+    </div>
+  </div>
+
+  <!-- TRACKS -->
+  <div style="margin-bottom: 12px;">
+    <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 6px;">
+      <label class="section-label" style="margin-bottom: 0;">Choose Track</label>
+      <span id="track-count-badge" style="font-size: 0.72rem; color: #8e8e93;"></span>
+    </div>
+    <input type="text" id="track-filter" placeholder="🔍 Search track or reciter..." style="margin-bottom: 6px;" />
+    <select id="track-select" size="4" style="height: 110px;"></select>
+    
+    <div style="margin-top: 8px;">
+      <button id="btn-play-track" class="btn-primary" style="width: 100%;">
+        ▶ Play Selected Track
+      </button>
+    </div>
+  </div>
+
+  <!-- ADD / REMOVE -->
+  <div style="margin-bottom: 14px;">
+    <label class="section-label">Playlist Management (Selected Track)</label>
+    <div class="btn-grid">
+      <button id="btn-add" class="btn-success">➕ Add to Playlist</button>
+      <button id="btn-remove" class="btn-danger">🗑️ Remove Track</button>
+    </div>
+  </div>
+
+  <!-- UPLOAD -->
+  <div style="padding-top: 12px; border-top: 1px solid rgba(255, 255, 255, 0.08);">
+    <label class="section-label">📤 Upload Audio File directly to iPhone 4S</label>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <input type="file" id="upload-file" accept="audio/*,.mp3,.m4a,.wav" style="flex: 1; font-size: 0.8rem; color: #8e8e93;" />
+      <button id="btn-upload" class="btn-purple" style="white-space: nowrap;">Upload</button>
+    </div>
+  </div>
+
+  <div id="toast" class="message-toast"></div>
+</div>
+
+<script>
+  const API = 'http://192.168.1.106:5005';
+  let playlists = [];
+  let playlistTracks = [];
+
+  function toast(msg, duration = 3500) {
+    const el = document.getElementById('toast');
+    el.innerText = msg;
+    if (msg) {
+      setTimeout(() => {
+        if (el.innerText === msg) el.innerText = '';
+      }, duration);
+    }
+  }
+
+  async function updateStatus() {
+    try {
+      const res = await fetch(`${API}/status`);
+      const data = await res.json();
+      
+      const badge = document.getElementById('state-badge');
+      badge.innerText = data.state || 'UNKNOWN';
+      badge.className = 'badge ' + (data.state === 'playing' ? 'playing' : (data.state === 'paused' ? 'paused' : ''));
+      
+      document.getElementById('now-title').innerText = data.title || 'No active track';
+      const meta = [data.artist, data.album, data.playlist ? `Playlist: ${data.playlist}` : ''].filter(Boolean).join(' • ');
+      document.getElementById('now-meta').innerText = meta;
+    } catch (e) {
+      document.getElementById('state-badge').innerText = 'OFFLINE';
+    }
+  }
+
+  async function loadPlaylists() {
+    try {
+      const res = await fetch(`${API}/playlists`);
+      const data = await res.json();
+      playlists = data.playlists.filter(p => p.count > 0 || ['1', 'AA - Quran', 'قرآن'].includes(p.name));
+      const sel = document.getElementById('pl-select');
+      const curVal = sel.value;
+      sel.innerHTML = '';
+      
+      playlists.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.name;
+        opt.innerText = `${p.name} (${p.count} tracks)`;
+        sel.appendChild(opt);
+      });
+
+      if (curVal && playlists.some(p => p.name === curVal)) {
+        sel.value = curVal;
+      }
+      loadTracks();
+    } catch (e) {
+      toast('Failed to load playlists');
+    }
+  }
+
+  async function loadTracks() {
+    try {
+      const plName = document.getElementById('pl-select').value;
+      if (!plName) return;
+      const res = await fetch(`${API}/tracks?playlist=${encodeURIComponent(plName)}`);
+      const data = await res.json();
+      playlistTracks = data.tracks || [];
+      renderTracks();
+    } catch (e) {
+      toast('Failed to load tracks');
+    }
+  }
+
+  function renderTracks() {
+    const query = (document.getElementById('track-filter').value || '').toLowerCase().trim();
+    const sel = document.getElementById('track-select');
+    sel.innerHTML = '';
+    
+    const filtered = playlistTracks.filter(t => 
+      t.title.toLowerCase().includes(query) || 
+      (t.artist && t.artist.toLowerCase().includes(query))
+    );
+
+    document.getElementById('track-count-badge').innerText = `${filtered.length} of ${playlistTracks.length}`;
+
+    filtered.forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t.id;
+      opt.innerText = t.title + (t.artist ? ` — ${t.artist}` : '');
+      sel.appendChild(opt);
+    });
+
+    if (sel.options.length > 0) sel.selectedIndex = 0;
+  }
+
+  document.getElementById('pl-select').addEventListener('change', loadTracks);
+  document.getElementById('track-filter').addEventListener('input', renderTracks);
+
+  document.getElementById('btn-play-pl').addEventListener('click', async () => {
+    const plName = document.getElementById('pl-select').value;
+    toast(`Starting playlist "${plName}"...`);
+    try {
+      const res = await fetch(`${API}/play_playlist?name=${encodeURIComponent(plName)}`);
+      const data = await res.json();
+      toast(data.message || 'Started');
+      updateStatus();
+    } catch (e) {
+      toast('Error playing playlist');
+    }
+  });
+
+  document.getElementById('btn-play-track').addEventListener('click', async () => {
+    const tid = document.getElementById('track-select').value;
+    if (!tid) return toast('Please select a track');
+    toast('Playing track...');
+    try {
+      const res = await fetch(`${API}/play_track?id=${tid}`);
+      const data = await res.json();
+      toast(data.message || 'Started');
+      updateStatus();
+    } catch (e) {
+      toast('Error playing track');
+    }
+  });
+
+  document.getElementById('btn-add').addEventListener('click', async () => {
+    const plName = document.getElementById('pl-select').value;
+    const tid = document.getElementById('track-select').value;
+    if (!plName || !tid) return toast('Select a playlist & track');
+    try {
+      const res = await fetch(`${API}/add_to_playlist?playlist=${encodeURIComponent(plName)}&track_id=${tid}`);
+      const data = await res.json();
+      toast(data.message || 'Track added');
+      loadPlaylists();
+    } catch (e) {
+      toast('Error adding track');
+    }
+  });
+
+  document.getElementById('btn-remove').addEventListener('click', async () => {
+    const plName = document.getElementById('pl-select').value;
+    const tid = document.getElementById('track-select').value;
+    if (!plName || !tid) return toast('Select a playlist & track');
+    try {
+      const res = await fetch(`${API}/remove_from_playlist?playlist=${encodeURIComponent(plName)}&track_id=${tid}`);
+      const data = await res.json();
+      toast(data.message || 'Track removed');
+      loadPlaylists();
+    } catch (e) {
+      toast('Error removing track');
+    }
+  });
+
+  document.getElementById('btn-upload').addEventListener('click', async () => {
+    const fileInput = document.getElementById('upload-file');
+    const file = fileInput.files[0];
+    if (!file) return toast('Please select an audio file first');
+    const pl = document.getElementById('pl-select').value || '';
+    
+    toast(`Uploading ${file.name}...`);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('playlist', pl);
+      
+      const res = await fetch(`${API}/upload`, {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      toast(data.message || 'Uploaded successfully!');
+      fileInput.value = '';
+      loadPlaylists();
+    } catch (e) {
+      toast('Upload error: ' + e.message);
+    }
+  });
+
+  loadPlaylists();
+  updateStatus();
+  setInterval(updateStatus, 3000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,12 @@
+[Unit]
+Description=Ubuntu Laptop Homelab MQTT Power Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/linux_laptop_agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
