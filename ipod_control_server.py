@@ -3,6 +3,7 @@
 import cgi
 import ctypes
 import os
+import random
 import sqlite3
 import struct
 import threading
@@ -263,7 +264,32 @@ url_last_tick = 0.0
 def _loc_to_url(loc):
     if loc.startswith('http://') or loc.startswith('https://') or loc.startswith('file://'):
         return loc
+    if loc.startswith('/'):
+        return 'file://' + urllib.quote(loc)
     return 'file://' + AUDIO_DIR + '/' + urllib.quote(loc)
+
+def local_library_items():
+    """Songs already in the phone's Music library as [title, absolute_path, 0] (dur 0 =
+    detect the end via AVPlayer rate). Telegram files copied into the library are skipped."""
+    items = []
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT ie.title, bl.path, ie.location FROM item_extra ie "
+                  "JOIN item i ON ie.item_pid=i.item_pid "
+                  "LEFT JOIN base_location bl ON i.base_location_id=bl.base_location_id "
+                  "WHERE ie.location IS NOT NULL AND ie.location != ''")
+        for title, base, loc in c.fetchall():
+            full = '/var/mobile/Media/' + (base or '') + '/' + loc
+            if os.path.exists(full):
+                t = title or 'Unknown Title'
+                if isinstance(t, unicode):
+                    t = t.encode('utf-8')
+                items.append([t, full, '0'])
+        conn.close()
+    except Exception, e:
+        print '[iPod Server] local_library_items error:', e
+    return items
 
 def _av_start(index):
     global av_player, url_index, url_paused, url_elapsed, url_last_tick
@@ -283,10 +309,17 @@ def _av_start(index):
     pump_runloop(0.3)
     return True
 
-def play_queue(items, start=0):
-    """items: list of [title, location, duration_seconds]"""
+def play_queue(items, start=0, mix_local=False, shuffle=False):
+    """items: list of [title, location, duration_seconds]. mix_local adds the Music
+    library songs; shuffle randomises the final order (start is then ignored)."""
     global url_mode, url_queue, user_paused
     try:
+        items = list(items)
+        if mix_local:
+            items += local_library_items()
+        if shuffle:
+            random.shuffle(items)
+            start = 0
         url_queue = [{'title': i[0], 'loc': i[1], 'dur': float(i[2]) if len(i) > 2 else 0.0} for i in items]
         if not url_queue:
             return False, "Empty queue"
@@ -322,8 +355,14 @@ def url_tick():
     url_elapsed += now - url_last_tick
     url_last_tick = now
     dur = url_queue[url_index]['dur']
-    if dur and url_elapsed > dur + 2:
-        _av_start(url_index + 1)
+    if dur:
+        if url_elapsed > dur + 2:
+            _av_start(url_index + 1)
+    elif url_elapsed > 3:
+        # unknown duration: AVPlayer rate drops to 0 when the item finished
+        rate = msg(av_player, 'rate', restype=ctypes.c_float)
+        if rate == 0:
+            _av_start(url_index + 1)
 
 def stop_queue():
     global av_player, url_mode, user_paused
@@ -691,7 +730,9 @@ print "SUCCESS"
                         if rec:
                             items.append([urllib.unquote(x) for x in rec.split(',')])
                     start_i = int(query.get('start', ['0'])[0])
-                    ok, message = play_queue(items, start_i)
+                    mix = query.get('local', ['0'])[0] == '1'
+                    shuf = query.get('shuffle', ['0'])[0] == '1'
+                    ok, message = play_queue(items, start_i, mix, shuf)
                 except Exception, e:
                     ok, message = False, str(e)
                 self.send_json_str('{"status": "%s", "message": "%s"}' % (
