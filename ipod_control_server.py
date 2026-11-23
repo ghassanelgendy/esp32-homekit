@@ -40,12 +40,25 @@ def msg(obj, sel_name, *args, **kwargs):
     sel = objc.sel_registerName(str(sel_name))
     return func(obj, sel, *args)
 
+def to_utf8(s):
+    if s is None:
+        return ''
+    if isinstance(s, unicode):
+        return s.encode('utf-8', 'ignore')
+    return str(s)
+
+def to_unicode(s):
+    if s is None:
+        return u''
+    if isinstance(s, unicode):
+        return s
+    try:
+        return str(s).decode('utf-8', 'ignore')
+    except Exception:
+        return unicode(str(s), 'latin1', 'ignore')
+
 def to_ns(py_str):
-    if isinstance(py_str, unicode):
-        py_str = py_str.encode('utf-8', 'ignore')
-    else:
-        py_str = str(py_str)
-    return msg(objc.objc_getClass('NSString'), 'stringWithUTF8String:', py_str, argtypes=[ctypes.c_char_p])
+    return msg(objc.objc_getClass('NSString'), 'stringWithUTF8String:', to_utf8(py_str), argtypes=[ctypes.c_char_p])
 
 def to_py(ns_str):
     if not ns_str: return ''
@@ -309,9 +322,11 @@ def db_playlist_file_items(playlist_name):
     """Return file-backed items for an iTunes DB playlist in order."""
     items = []
     try:
+        pl_u = to_unicode(playlist_name)
+        pl_utf8 = to_utf8(playlist_name)
         conn = get_db()
         c = conn.cursor()
-        c.execute("SELECT container_pid FROM container WHERE name=? LIMIT 1", (playlist_name,))
+        c.execute("SELECT container_pid FROM container WHERE name=? LIMIT 1", (pl_u,))
         crow = c.fetchone()
         if not crow:
             conn.close()
@@ -343,12 +358,8 @@ def db_playlist_file_items(playlist_name):
                 if loc:
                     full = '/var/mobile/Media/' + (base or '') + '/' + loc
                     if os.path.exists(full):
-                        t = title or 'Unknown Title'
-                        if isinstance(t, unicode):
-                            t = t.encode('utf-8', 'ignore')
-                        a = artist or playlist_name
-                        if isinstance(a, unicode):
-                            a = a.encode('utf-8', 'ignore')
+                        t = to_utf8(title or 'Unknown Title')
+                        a = to_utf8(artist or pl_utf8)
                         items.append({
                             'id': str(pid),
                             'title': t,
@@ -392,20 +403,21 @@ def list_playlists():
     return playlists
 
 def list_tracks(playlist_name=None):
-    if playlist_name == "Telegram":
+    pl_utf8 = to_utf8(playlist_name) if playlist_name is not None else None
+    if pl_utf8 == "Telegram":
         return [{
             "id": x['id'],
             "title": x['title'],
             "artist": x['artist'],
             "duration": int(x['dur'])
         } for x in telegram_audio_items()]
-    if playlist_name == "Telegram + Local":
+    if pl_utf8 == "Telegram + Local":
         return list_tracks("Telegram") + list_tracks("__local_only__")
 
     conn = get_db()
     c = conn.cursor()
-    if playlist_name and playlist_name != "__local_only__":
-        c.execute("SELECT container_pid FROM container WHERE name=? LIMIT 1", (playlist_name,))
+    if pl_utf8 and pl_utf8 != "__local_only__":
+        c.execute("SELECT container_pid FROM container WHERE name=? LIMIT 1", (to_unicode(playlist_name),))
         crow = c.fetchone()
         if not crow:
             conn.close()
@@ -914,40 +926,38 @@ def play_by_playlist(pl_name):
     global current_playlist_name, user_paused
     player_lock.acquire()
     try:
-        if pl_name == 'Telegram':
+        pl_utf8 = to_utf8(pl_name)
+        if pl_utf8 == 'Telegram':
             tg_items = telegram_audio_items()
             if not tg_items:
                 return False, "No Telegram tracks found"
             return play_queue(tg_items, start=0, mix_local=False, shuffle=shuffle_enabled, playlist_name='Telegram')
-        if pl_name == 'Telegram + Local':
+        if pl_utf8 == 'Telegram + Local':
             tg_items = telegram_audio_items()
             return play_queue(tg_items, start=0, mix_local=True, shuffle=shuffle_enabled, local_max=40, playlist_name='Telegram + Local')
 
+        db_items = db_playlist_file_items(pl_name)
+        if len(db_items) > 0:
+            return play_queue(db_items, start=0, mix_local=False, shuffle=shuffle_enabled, playlist_name=pl_utf8)
+
         stop_queue()
         pred = msg(pred_cls, 'predicateWithValue:forProperty:',
-                   to_ns(pl_name), to_ns('name'),
+                   to_ns(pl_utf8), to_ns('name'),
                    argtypes=[ctypes.c_void_p, ctypes.c_void_p])
         pl_query = msg(query_cls, 'playlistsQuery')
         msg(pl_query, 'addFilterPredicate:', pred, argtypes=[ctypes.c_void_p])
         items = msg(pl_query, 'items')
         mp_count = msg(items, 'count', restype=ctypes.c_ulong) if items else 0
-
-        db_items = db_playlist_file_items(pl_name)
-        if len(db_items) > mp_count and len(db_items) > 0:
-            return play_queue(db_items, start=0, mix_local=False, shuffle=shuffle_enabled, playlist_name=pl_name)
-
         if mp_count == 0:
-            if len(db_items) > 0:
-                return play_queue(db_items, start=0, mix_local=False, shuffle=shuffle_enabled, playlist_name=pl_name)
             return False, "Playlist empty or not found"
 
         msg(player, 'setQueueWithQuery:', pl_query, argtypes=[ctypes.c_void_p])
         apply_modes_to_ipod()
         msg(player, 'play')
         pump_runloop(0.1)
-        current_playlist_name = pl_name
+        current_playlist_name = pl_utf8
         user_paused = False
-        return True, "Playing playlist %s (%d tracks)" % (pl_name, mp_count)
+        return True, "Playing playlist %s (%d tracks)" % (pl_utf8, mp_count)
     except Exception, e:
         return False, str(e)
     finally:
@@ -957,11 +967,12 @@ def play_by_track_id(track_id, pl_name=None):
     global user_paused, current_playlist_name
     player_lock.acquire()
     try:
-        tid_str = str(track_id or '').strip()
+        tid_str = to_utf8(track_id).strip()
+        pl_utf8 = to_utf8(pl_name).strip() if pl_name else ''
         if not tid_str:
             return False, "No track specified"
 
-        # Resolve human-readable track label / title if not a raw ID
+        # Resolve human-readable track label / title / search query if not a raw ID
         is_raw_id = tid_str.startswith('tg:')
         if not is_raw_id:
             try:
@@ -971,7 +982,7 @@ def play_by_track_id(track_id, pl_name=None):
                 is_raw_id = False
 
         if not is_raw_id:
-            search_pl = pl_name or current_playlist_name or 'Telegram + Local'
+            search_pl = pl_utf8 or current_playlist_name or 'Telegram + Local'
             named = get_playlist_named_tracks(search_pl)
             matched = None
             for entry in named:
@@ -979,10 +990,24 @@ def play_by_track_id(track_id, pl_name=None):
                     matched = entry
                     break
             if not matched:
-                for entry in get_playlist_named_tracks(None):
+                all_named = get_playlist_named_tracks(None)
+                for entry in all_named:
                     if entry['label'] == tid_str or entry['title'] == tid_str:
                         matched = entry
                         break
+                # Substring search fallback (case-insensitive)
+                if not matched:
+                    q_low = tid_str.lower()
+                    for entry in named:
+                        if q_low in entry['label'].lower() or q_low in entry['title'].lower() or q_low in entry['artist'].lower():
+                            matched = entry
+                            break
+                if not matched:
+                    q_low = tid_str.lower()
+                    for entry in all_named:
+                        if q_low in entry['label'].lower() or q_low in entry['title'].lower() or q_low in entry['artist'].lower():
+                            matched = entry
+                            break
             if not matched:
                 return False, "Track not found: %s" % tid_str
             tid_str = matched['id']
@@ -995,70 +1020,20 @@ def play_by_track_id(track_id, pl_name=None):
                 if x['loc'] == fname or x['id'] == tid_str:
                     start_idx = idx
                     break
-            mix = (pl_name == 'Telegram + Local') or (not pl_name and current_playlist_name == 'Telegram + Local')
+            mix = (pl_utf8 == 'Telegram + Local') or (not pl_utf8 and current_playlist_name == 'Telegram + Local')
             target_pl = 'Telegram + Local' if mix else 'Telegram'
             return play_queue(tg_items, start=start_idx, mix_local=mix, shuffle=shuffle_enabled,
                               local_max=40 if mix else 0, playlist_name=target_pl, keep_start=True)
 
-        # If playing a track inside an uploaded/mixed DB playlist (like AA - Quran), use play_queue if needed
         tid_int = int(tid_str)
-        if pl_name and pl_name not in ('Telegram', 'Telegram + Local'):
-            db_items = db_playlist_file_items(pl_name)
+        if pl_utf8 and pl_utf8 not in ('Telegram', 'Telegram + Local'):
+            db_items = db_playlist_file_items(pl_utf8)
             for idx, x in enumerate(db_items):
                 if x['id'] == str(tid_int):
-                    pred = msg(pred_cls, 'predicateWithValue:forProperty:',
-                               to_ns(pl_name), to_ns('name'),
-                               argtypes=[ctypes.c_void_p, ctypes.c_void_p])
-                    pl_query = msg(query_cls, 'playlistsQuery')
-                    msg(pl_query, 'addFilterPredicate:', pred, argtypes=[ctypes.c_void_p])
-                    pitems = msg(pl_query, 'items')
-                    mp_count = msg(pitems, 'count', restype=ctypes.c_ulong) if pitems else 0
-                    if len(db_items) > mp_count:
-                        return play_queue(db_items, start=idx, mix_local=False, shuffle=shuffle_enabled,
-                                          playlist_name=pl_name, keep_start=True)
-                    break
+                    return play_queue(db_items, start=idx, mix_local=False, shuffle=shuffle_enabled,
+                                      playlist_name=pl_utf8, keep_start=True)
 
-        stop_queue()
-        tid_u64 = ctypes.c_ulonglong(tid_int).value
-        pid_num = msg(num_cls, 'numberWithUnsignedLongLong:', ctypes.c_ulonglong(tid_u64), argtypes=[ctypes.c_ulonglong])
-        pred = msg(pred_cls, 'predicateWithValue:forProperty:', pid_num, to_ns('persistentID'), argtypes=[ctypes.c_void_p, ctypes.c_void_p])
-        
-        squery = msg(query_cls, 'songsQuery')
-        msg(squery, 'addFilterPredicate:', pred, argtypes=[ctypes.c_void_p])
-        items = msg(squery, 'items')
-        count = msg(items, 'count', restype=ctypes.c_ulong) if items else 0
-        if count > 0:
-            target_item = msg(items, 'objectAtIndex:', 0, argtypes=[ctypes.c_ulong])
-            queue_query = None
-            if pl_name and pl_name not in ('Telegram', 'Telegram + Local'):
-                pl_pred = msg(pred_cls, 'predicateWithValue:forProperty:',
-                              to_ns(pl_name), to_ns('name'),
-                              argtypes=[ctypes.c_void_p, ctypes.c_void_p])
-                pl_q = msg(query_cls, 'playlistsQuery')
-                msg(pl_q, 'addFilterPredicate:', pl_pred, argtypes=[ctypes.c_void_p])
-                pl_items = msg(pl_q, 'items')
-                if pl_items and msg(pl_items, 'count', restype=ctypes.c_ulong) > 0:
-                    queue_query = pl_q
-                    current_playlist_name = pl_name
-            if not queue_query:
-                queue_query = msg(query_cls, 'songsQuery')
-            msg(player, 'setQueueWithQuery:', queue_query, argtypes=[ctypes.c_void_p])
-            apply_modes_to_ipod()
-            msg(player, 'setNowPlayingItem:', target_item, argtypes=[ctypes.c_void_p])
-            msg(player, 'play')
-            pump_runloop(0.15)
-            now_item = msg(player, 'nowPlayingItem')
-            now_pid = 0
-            if now_item:
-                pnum = msg(now_item, 'valueForProperty:', to_ns('persistentID'), argtypes=[ctypes.c_void_p])
-                if pnum:
-                    u64 = msg(pnum, 'unsignedLongLongValue', restype=ctypes.c_ulonglong)
-                    now_pid = ctypes.c_longlong(u64).value
-            if now_pid == tid_int:
-                user_paused = False
-                return True, "Track started"
-
-        # Fallback for uploaded tracks in SQLite that MPMusicPlayerController won't play directly
+        # Fallback: find the track in SQLite and queue it with the active playlist or local library
         conn = get_db()
         c = conn.cursor()
         c.execute("SELECT ie.title, bl.path, ie.location, ia.item_artist "
@@ -1072,12 +1047,16 @@ def play_by_track_id(track_id, pl_name=None):
         if row and row[2]:
             full = '/var/mobile/Media/' + (row[1] or '') + '/' + row[2]
             if os.path.exists(full):
-                t = row[0] or 'Unknown Title'
-                if isinstance(t, unicode): t = t.encode('utf-8', 'ignore')
-                a = row[3] or 'Telegram'
-                if isinstance(a, unicode): a = a.encode('utf-8', 'ignore')
-                return play_queue([{'id': str(tid_int), 'title': t, 'artist': a, 'loc': full, 'dur': 0.0}],
-                                  start=0, mix_local=False, shuffle=False, playlist_name=pl_name or current_playlist_name or 'Telegram')
+                t = to_utf8(row[0] or 'Unknown Title')
+                a = to_utf8(row[3] or pl_utf8 or 'Local Library')
+                target_item = {'id': str(tid_int), 'title': t, 'artist': a, 'loc': full, 'dur': 0.0}
+                all_loc = local_library_items()
+                rest_loc = [x for x in all_loc if x['id'] != str(tid_int)]
+                if len(rest_loc) > 60:
+                    rest_loc = random.sample(rest_loc, 60)
+                return play_queue([target_item] + rest_loc,
+                                  start=0, mix_local=False, shuffle=shuffle_enabled,
+                                  playlist_name=pl_utf8 or current_playlist_name or 'Local Library', keep_start=True)
         return False, "Track not found"
     except Exception, e:
         return False, str(e)
