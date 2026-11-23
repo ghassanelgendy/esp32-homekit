@@ -142,6 +142,16 @@
     <div id="now-meta" class="track-meta"></div>
   </div>
 
+  <!-- PLAYBACK MODES: REPEAT / REPEAT ONCE / SHUFFLE -->
+  <div style="margin-bottom: 12px;">
+    <label class="section-label">Playback Options</label>
+    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;">
+      <button id="btn-repeat-all" title="Repeat All">🔁 Repeat</button>
+      <button id="btn-repeat-one" title="Repeat Once">🔂 Repeat Once</button>
+      <button id="btn-shuffle" title="Shuffle">🔀 Shuffle</button>
+    </div>
+  </div>
+
   <!-- PLAYLIST -->
   <div style="margin-bottom: 12px;">
     <label class="section-label">Select Playlist</label>
@@ -215,16 +225,61 @@
       document.getElementById('now-title').innerText = data.title || 'No active track';
       const meta = [data.artist, data.album, data.playlist ? `Playlist: ${data.playlist}` : ''].filter(Boolean).join(' • ');
       document.getElementById('now-meta').innerText = meta;
+
+      const repAllBtn = document.getElementById('btn-repeat-all');
+      const repOneBtn = document.getElementById('btn-repeat-one');
+      const shufBtn = document.getElementById('btn-shuffle');
+      if (repAllBtn) repAllBtn.className = data.repeat === 'all' ? 'btn-primary' : '';
+      if (repOneBtn) repOneBtn.className = data.repeat === 'one' ? 'btn-primary' : '';
+      if (shufBtn) shufBtn.className = data.shuffle ? 'btn-primary' : '';
     } catch (e) {
       document.getElementById('state-badge').innerText = 'OFFLINE';
     }
   }
 
+  let currentRepeat = 'all';
+  let currentShuffle = true;
+
+  document.getElementById('btn-repeat-all').addEventListener('click', async () => {
+    try {
+      const res = await fetch(`${API}/status`);
+      const st = await res.json();
+      const nextMode = st.repeat === 'all' ? 'off' : 'all';
+      await fetch(`${API}/repeat?mode=${nextMode}`);
+      toast(nextMode === 'all' ? 'Repeat enabled' : 'Repeat off');
+      updateStatus();
+    } catch (e) {
+      toast('Error setting repeat');
+    }
+  });
+
+  document.getElementById('btn-repeat-one').addEventListener('click', async () => {
+    try {
+      const res = await fetch(`${API}/status`);
+      const st = await res.json();
+      const nextMode = st.repeat === 'one' ? 'off' : 'one';
+      await fetch(`${API}/repeat?mode=${nextMode}`);
+      toast(nextMode === 'one' ? 'Repeat Once enabled' : 'Repeat off');
+      updateStatus();
+    } catch (e) {
+      toast('Error setting repeat once');
+    }
+  });
+
+  document.getElementById('btn-shuffle').addEventListener('click', async () => {
+    try {
+      await fetch(`${API}/shuffle?mode=toggle`);
+      updateStatus();
+    } catch (e) {
+      toast('Error toggling shuffle');
+    }
+  });
+
   async function loadPlaylists() {
     try {
       const res = await fetch(`${API}/playlists`);
       const data = await res.json();
-      playlists = data.playlists.filter(p => p.count > 0 || ['1', 'AA - Quran', 'قرآن'].includes(p.name));
+      playlists = data.playlists.filter(p => p.count > 0 || ['Telegram', 'Telegram + Local', '1', 'AA - Quran', 'قرآن'].includes(p.name));
       const sel = document.getElementById('pl-select');
       const curVal = sel.value;
       sel.innerHTML = '';
